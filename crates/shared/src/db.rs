@@ -3,7 +3,12 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use crate::models::user::User;
 use crate::models::library::LibraryItem;
 use crate::models::progress::{WatchProgress, WatchEvent, WatchStatus, NextEpisode};
+use crate::models::series::WatchProviders;
 use std::collections::HashMap;
+
+const CACHE_TTL_MONTH: i64 = 30 * 24 * 3600;
+const CACHE_TTL_PROVIDERS: i64 = 7 * 24 * 3600;
+const CACHE_TTL_SEARCH: i64 = 3600;
 
 pub async fn get_client() -> Client {
     if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
@@ -23,6 +28,15 @@ pub async fn get_client() -> Client {
 
 fn get_str<'a>(item: &'a HashMap<String, AttributeValue>, key: &str) -> &'a str {
     item.get(key).and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or("")
+}
+
+fn is_cache_expired(item: &HashMap<String, AttributeValue>) -> bool {
+    let expires_at = item.get("expiresAt")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    
+    chrono::Utc::now().timestamp() > expires_at
 }
 
 fn get_i32(item: &HashMap<String, AttributeValue>, key: &str) -> i32 {
@@ -454,6 +468,10 @@ pub async fn get_cached_series(client: &Client, table: &str, tmdb_id: i64) -> Re
         None => return Ok(None),
     };
 
+    if is_cache_expired(&item) {
+        return Ok(None);
+    }
+
     Ok(Some(crate::models::series::Series {
         id: get_str(item, "id").to_string(),
         tmdb_id,
@@ -474,7 +492,7 @@ pub async fn get_cached_series(client: &Client, table: &str, tmdb_id: i64) -> Re
 }
 
 pub async fn cache_series(client: &Client, table: &str, series: &crate::models::series::Series) -> Result<(), aws_sdk_dynamodb::Error> {
-    let expires_at = chrono::Utc::now().timestamp() + 7 * 24 * 3600;
+    let expires_at = chrono::Utc::now().timestamp() + CACHE_TTL_MONTH;
     let mut item = std::collections::HashMap::new();
     item.insert("PK".to_string(), AttributeValue::S(format!("SERIES#{}", series.tmdb_id)));
     item.insert("SK".to_string(), AttributeValue::S("META".to_string()));
@@ -503,6 +521,187 @@ pub async fn cache_series(client: &Client, table: &str, series: &crate::models::
         .await?;
 
     Ok(())
+}
+
+pub async fn cache_providers(
+    client: &Client,
+    table: &str,
+    tmdb_id: i64,
+    providers: &WatchProviders,
+) -> Result<(), aws_sdk_dynamodb::Error> {
+    let expires_at = chrono::Utc::now().timestamp() + CACHE_TTL_PROVIDERS;
+    let mut item = HashMap::new();
+    item.insert("PK".to_string(), AttributeValue::S(format!("SERIES#{}", tmdb_id)));
+    item.insert("SK".to_string(), AttributeValue::S("PROVIDERS".to_string()));
+    item.insert("expiresAt".to_string(), AttributeValue::N(expires_at.to_string()));
+    item.insert("updatedAt".to_string(), AttributeValue::S(chrono::Utc::now().to_rfc3339()));
+
+    if let Some(ref flatrate) = providers.flatrate {
+        let names: Vec<String> = flatrate.iter().map(|p| p.provider_name.clone()).collect();
+        item.insert("flatrate".to_string(), AttributeValue::Ss(names));
+    }
+    if let Some(ref rent) = providers.rent {
+        let names: Vec<String> = rent.iter().map(|p| p.provider_name.clone()).collect();
+        item.insert("rent".to_string(), AttributeValue::Ss(names));
+    }
+    if let Some(ref buy) = providers.buy {
+        let names: Vec<String> = buy.iter().map(|p| p.provider_name.clone()).collect();
+        item.insert("buy".to_string(), AttributeValue::Ss(names));
+    }
+    if let Some(ref free) = providers.free {
+        let names: Vec<String> = free.iter().map(|p| p.provider_name.clone()).collect();
+        item.insert("free".to_string(), AttributeValue::Ss(names));
+    }
+
+    client
+        .put_item()
+        .table_name(table)
+        .set_item(Some(item))
+        .send()
+        .await?;
+
+    Ok(())
+}
+
+pub async fn get_cached_providers(
+    client: &Client,
+    table: &str,
+    tmdb_id: i64,
+) -> Result<Option<WatchProviders>, aws_sdk_dynamodb::Error> {
+    let result = client
+        .get_item()
+        .table_name(table)
+        .key("PK", AttributeValue::S(format!("SERIES#{}", tmdb_id)))
+        .key("SK", AttributeValue::S("PROVIDERS".to_string()))
+        .send()
+        .await?;
+
+    let item = match result.item() {
+        Some(item) => item,
+        None => return Ok(None),
+    };
+
+    if is_cache_expired(&item) {
+        return Ok(None);
+    }
+
+    let flatrate = item.get("flatrate").and_then(|v| v.as_ss().ok()).map(|names| {
+        names.iter().map(|name| crate::models::series::Provider {
+            provider_id: 0,
+            provider_name: name.clone(),
+            logo_path: None,
+        }).collect()
+    });
+
+    let rent = item.get("rent").and_then(|v| v.as_ss().ok()).map(|names| {
+        names.iter().map(|name| crate::models::series::Provider {
+            provider_id: 0,
+            provider_name: name.clone(),
+            logo_path: None,
+        }).collect()
+    });
+
+    let buy = item.get("buy").and_then(|v| v.as_ss().ok()).map(|names| {
+        names.iter().map(|name| crate::models::series::Provider {
+            provider_id: 0,
+            provider_name: name.clone(),
+            logo_path: None,
+        }).collect()
+    });
+
+    let free = item.get("free").and_then(|v| v.as_ss().ok()).map(|names| {
+        names.iter().map(|name| crate::models::series::Provider {
+            provider_id: 0,
+            provider_name: name.clone(),
+            logo_path: None,
+        }).collect()
+    });
+
+    Ok(Some(WatchProviders {
+        flatrate,
+        rent,
+        buy,
+        free,
+    }))
+}
+
+pub async fn cache_search_results(
+    client: &Client,
+    table: &str,
+    query: &str,
+    page: i32,
+    results: &[crate::models::series::CatalogSeries],
+    total_pages: i32,
+) -> Result<(), aws_sdk_dynamodb::Error> {
+    let expires_at = chrono::Utc::now().timestamp() + CACHE_TTL_SEARCH;
+    let cache_key = format!("SEARCH#{}#{}", query.to_lowercase(), page);
+    
+    let serialized = serde_json::to_string(&serde_json::json!({
+        "results": results,
+        "total_pages": total_pages,
+    })).unwrap_or_default();
+
+    let mut item = HashMap::new();
+    item.insert("PK".to_string(), AttributeValue::S(cache_key));
+    item.insert("SK".to_string(), AttributeValue::S("RESULTS".to_string()));
+    item.insert("expiresAt".to_string(), AttributeValue::N(expires_at.to_string()));
+    item.insert("data".to_string(), AttributeValue::S(serialized));
+
+    client
+        .put_item()
+        .table_name(table)
+        .set_item(Some(item))
+        .send()
+        .await?;
+
+    Ok(())
+}
+
+pub async fn get_cached_search(
+    client: &Client,
+    table: &str,
+    query: &str,
+    page: i32,
+) -> Result<Option<(Vec<crate::models::series::CatalogSeries>, i32)>, aws_sdk_dynamodb::Error> {
+    let cache_key = format!("SEARCH#{}#{}", query.to_lowercase(), page);
+    
+    let result = client
+        .get_item()
+        .table_name(table)
+        .key("PK", AttributeValue::S(cache_key))
+        .key("SK", AttributeValue::S("RESULTS".to_string()))
+        .send()
+        .await?;
+
+    let item = match result.item() {
+        Some(item) => item,
+        None => return Ok(None),
+    };
+
+    if is_cache_expired(&item) {
+        return Ok(None);
+    }
+
+    let data = match item.get("data").and_then(|v| v.as_s().ok()) {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+
+    let results: Vec<crate::models::series::CatalogSeries> = match serde_json::from_value(
+        parsed.get("results").cloned().unwrap_or(serde_json::Value::Array(vec![]))
+    ) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+
+    let total_pages = parsed.get("total_pages").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+
+    Ok(Some((results, total_pages)))
 }
 
 pub async fn get_cached_seasons(client: &Client, table: &str, tmdb_id: i64) -> Result<Vec<crate::models::season::Season>, aws_sdk_dynamodb::Error> {

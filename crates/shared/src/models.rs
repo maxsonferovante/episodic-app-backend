@@ -20,7 +20,7 @@ pub mod series {
         pub updated_at: String,
     }
 
-    #[derive(Debug, Serialize)]
+    #[derive(Debug, Serialize, Deserialize)]
     pub struct CatalogSeries {
         pub id: i64,
         pub name: String,

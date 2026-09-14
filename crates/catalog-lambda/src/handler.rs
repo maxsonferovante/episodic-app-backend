@@ -39,6 +39,23 @@ async fn handle_search(req: Request) -> Result<Response<Body>, Box<dyn std::erro
         return Ok(error_response(AppError::Internal("Missing required parameter: q".into())));
     }
 
+    let table = std::env::var("DYNAMODB_TABLE_NAME").unwrap_or_else(|_| "episodic".to_string());
+    let client = db::get_client().await;
+
+    if let Ok(Some((cached_items, cached_total_pages))) = db::get_cached_search(&client, &table, &q, page).await {
+        let body = json!({
+            "items": cached_items,
+            "pagination": { "page": page, "totalPages": cached_total_pages }
+        });
+        let mut resp = Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        add_cors(&mut resp);
+        return Ok(resp);
+    }
+
     let search_resp = match crate::tmdb::search_tv(&q, page).await {
         Ok(r) => r,
         Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB search failed: {}", e)))),
@@ -50,6 +67,8 @@ async fn handle_search(req: Request) -> Result<Response<Body>, Box<dyn std::erro
         poster_path: r.poster_path,
         first_air_date: r.first_air_date,
     }).collect();
+
+    let _ = db::cache_search_results(&client, &table, &q, page, &items, search_resp.total_pages).await;
 
     let body = json!({
         "items": items,
@@ -73,7 +92,7 @@ async fn handle_series_details(path: &str) -> Result<Response<Body>, Box<dyn std
     let client = db::get_client().await;
 
     if let Ok(Some(cached)) = db::get_cached_series(&client, &table, tmdb_id).await {
-        let providers = extract_providers_from_cache(&client, &table, tmdb_id).await;
+        let providers = db::get_cached_providers(&client, &table, tmdb_id).await.unwrap_or(None);
         let body = build_series_response(&cached, providers);
         let mut resp = Response::builder()
             .status(200)
@@ -135,6 +154,10 @@ async fn handle_series_details(path: &str) -> Result<Response<Body>, Box<dyn std
             }).collect()),
         })
     });
+
+    if let Some(ref prov) = providers {
+        let _ = db::cache_providers(&client, &table, tmdb_id, prov).await;
+    }
 
     let body = build_series_response(&series, providers);
     let mut resp = Response::builder()
@@ -286,9 +309,7 @@ fn build_series_response(series: &Series, providers: Option<WatchProviders>) -> 
     resp
 }
 
-async fn extract_providers_from_cache(_client: &aws_sdk_dynamodb::Client, _table: &str, _tmdb_id: i64) -> Option<WatchProviders> {
-    None
-}
+
 
 pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
     let method = req.method().clone();
