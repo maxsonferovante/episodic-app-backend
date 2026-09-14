@@ -32,9 +32,16 @@ pub async fn validate_google_token(token: &str) -> Result<GoogleTokenPayload, Bo
         return Err(format!("Google token validation failed: {}", msg).into());
     }
 
+    let sub = resp["sub"].as_str().unwrap_or("").to_string();
+    let email = resp["email"].as_str().unwrap_or("").to_string();
+
+    if sub.is_empty() || email.is_empty() {
+        return Err("Google token missing required fields (sub, email)".into());
+    }
+
     Ok(GoogleTokenPayload {
-        sub: resp["sub"].as_str().unwrap_or("").to_string(),
-        email: resp["email"].as_str().unwrap_or("").to_string(),
+        sub,
+        email,
         name: resp["name"].as_str().unwrap_or("").to_string(),
         picture: resp.get("picture").and_then(|v| v.as_str()).map(|s| s.to_string()),
     })
