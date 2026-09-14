@@ -1,21 +1,11 @@
 use lambda_http::{Body, Request, Response};
 use shared::db;
-use shared::error::AppError;
+use shared::error::{AppError, app_error_response as error_response, add_cors};
 use shared::id;
 use shared::models::series::{CatalogSeries, Series, WatchProviders, Provider};
 use shared::models::season::Season;
 use shared::models::episode::Episode;
 use serde_json::json;
-
-fn error_response(err: AppError) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
-    let status = err.status_code();
-    let body = serde_json::to_string(&err)?;
-    Ok(Response::builder()
-        .status(status.as_u16())
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap())
-}
 
 fn parse_query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
@@ -46,10 +36,13 @@ async fn handle_search(req: Request) -> Result<Response<Body>, Box<dyn std::erro
         .unwrap_or(1);
 
     if q.is_empty() {
-        return error_response(AppError::Internal("Missing required parameter: q".into()));
+        return Ok(error_response(AppError::Internal("Missing required parameter: q".into())));
     }
 
-    let search_resp = crate::tmdb::search_tv(&q, page).await.map_err(|_| AppError::TmdbUnavailable)?;
+    let search_resp = match crate::tmdb::search_tv(&q, page).await {
+        Ok(r) => r,
+        Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB search failed: {}", e)))),
+    };
 
     let items: Vec<CatalogSeries> = search_resp.results.into_iter().map(|r| CatalogSeries {
         id: r.id,
@@ -63,11 +56,13 @@ async fn handle_search(req: Request) -> Result<Response<Body>, Box<dyn std::erro
         "pagination": { "page": page, "totalPages": search_resp.total_pages }
     });
 
-    Ok(Response::builder()
+    let mut resp = Response::builder()
         .status(200)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
-        .unwrap())
+        .unwrap();
+    add_cors(&mut resp);
+    Ok(resp)
 }
 
 async fn handle_series_details(path: &str) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
@@ -80,14 +75,19 @@ async fn handle_series_details(path: &str) -> Result<Response<Body>, Box<dyn std
     if let Ok(Some(cached)) = db::get_cached_series(&client, &table, tmdb_id).await {
         let providers = extract_providers_from_cache(&client, &table, tmdb_id).await;
         let body = build_series_response(&cached, providers);
-        return Ok(Response::builder()
+        let mut resp = Response::builder()
             .status(200)
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
-            .unwrap());
+            .unwrap();
+        add_cors(&mut resp);
+        return Ok(resp);
     }
 
-    let details = crate::tmdb::get_tv_details(tmdb_id).await.map_err(|_| AppError::TmdbUnavailable)?;
+    let details = match crate::tmdb::get_tv_details(tmdb_id).await {
+        Ok(d) => d,
+        Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB details failed: {}", e)))),
+    };
 
     let now = chrono::Utc::now().to_rfc3339();
     let series = Series {
@@ -137,11 +137,13 @@ async fn handle_series_details(path: &str) -> Result<Response<Body>, Box<dyn std
     });
 
     let body = build_series_response(&series, providers);
-    Ok(Response::builder()
+    let mut resp = Response::builder()
         .status(200)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
-        .unwrap())
+        .unwrap();
+    add_cors(&mut resp);
+    Ok(resp)
 }
 
 async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
@@ -154,15 +156,20 @@ async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::
     if let Ok(cached) = db::get_cached_seasons(&client, &table, tmdb_id).await {
         if !cached.is_empty() {
             let body = json!({ "items": cached });
-            return Ok(Response::builder()
+            let mut resp = Response::builder()
                 .status(200)
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
-                .unwrap());
+                .unwrap();
+            add_cors(&mut resp);
+            return Ok(resp);
         }
     }
 
-    let tmdb_seasons = crate::tmdb::get_tv_seasons(tmdb_id).await.map_err(|_| AppError::TmdbUnavailable)?;
+    let tmdb_seasons = match crate::tmdb::get_tv_seasons(tmdb_id).await {
+        Ok(s) => s,
+        Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB seasons failed: {}", e)))),
+    };
 
     let seasons: Vec<Season> = tmdb_seasons.into_iter().map(|s| Season {
         id: id::generate("sea"),
@@ -177,17 +184,19 @@ async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::
     }).collect();
 
     let body = json!({ "items": seasons });
-    Ok(Response::builder()
+    let mut resp = Response::builder()
         .status(200)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
-        .unwrap())
+        .unwrap();
+    add_cors(&mut resp);
+    Ok(resp)
 }
 
 async fn handle_season_detail(path: &str) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() < 7 {
-        return error_response(AppError::Internal("Invalid path".into()));
+        return Ok(error_response(AppError::Internal("Invalid path".into())));
     }
 
     let tmdb_id: i64 = parts[4].parse().map_err(|_| AppError::Internal("Invalid series ID".into()))?;
@@ -202,15 +211,20 @@ async fn handle_season_detail(path: &str) -> Result<Response<Body>, Box<dyn std:
                 "seasonNumber": season_number,
                 "episodes": cached,
             });
-            return Ok(Response::builder()
+            let mut resp = Response::builder()
                 .status(200)
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
-                .unwrap());
+                .unwrap();
+            add_cors(&mut resp);
+            return Ok(resp);
         }
     }
 
-    let detail = crate::tmdb::get_tv_season_detail(tmdb_id, season_number).await.map_err(|_| AppError::TmdbUnavailable)?;
+    let detail = match crate::tmdb::get_tv_season_detail(tmdb_id, season_number).await {
+        Ok(d) => d,
+        Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB season detail failed: {}", e)))),
+    };
 
     let season_id = id::generate("sea");
     let series_id = format!("ser_{}", tmdb_id);
@@ -234,11 +248,13 @@ async fn handle_season_detail(path: &str) -> Result<Response<Body>, Box<dyn std:
         "episodes": episodes,
     });
 
-    Ok(Response::builder()
+    let mut resp = Response::builder()
         .status(200)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
-        .unwrap())
+        .unwrap();
+    add_cors(&mut resp);
+    Ok(resp)
 }
 
 fn detect_country() -> String {
@@ -279,10 +295,10 @@ pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std:
     let path = req.uri().path().to_string();
 
     if method != "GET" {
-        return error_response(AppError::Internal("Method not allowed".into()));
+        return Ok(error_response(AppError::Internal("Method not allowed".into())));
     }
 
-    if path.starts_with("/api/v1/series/search") {
+    if path.contains("/api/v1/series/search") {
         return handle_search(req).await;
     }
 
@@ -294,9 +310,9 @@ pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std:
         return handle_season_detail(&path).await;
     }
 
-    if path.starts_with("/api/v1/series/") && path.matches('/').count() == 5 {
+    if path.starts_with("/api/v1/series/") && path.matches('/').count() == 4 {
         return handle_series_details(&path).await;
     }
 
-    error_response(AppError::Internal("Not found".into()))
+    Ok(error_response(AppError::Internal("Not found".into())))
 }
