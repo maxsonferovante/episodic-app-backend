@@ -1,7 +1,7 @@
 use lambda_http::{Body, Request, Response};
 use shared::auth::extract_user_id;
 use shared::db::{get_client, get_continue_watching, get_upcoming, get_recent_history, get_history_page, get_calendar};
-use shared::error::AppError;
+use shared::error::{AppError, app_error_response, add_cors};
 use serde_json::json;
 
 fn get_table_name() -> Result<String, AppError> {
@@ -9,27 +9,24 @@ fn get_table_name() -> Result<String, AppError> {
         .map_err(|_| AppError::Internal("DYNAMODB_TABLE_NAME not set".into()))
 }
 
-fn error_response(status: u16, code: &str, message: &str) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Body::from(json!({ "error": { "code": code, "message": message } }).to_string()))
-        .unwrap())
-}
-
 pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
-    let method = req.method();
+    let method = req.method().as_str();
     let path = req.uri().path();
 
-    match (method.as_str(), path) {
-        ("GET", "/api/v1/dashboard") => handle_dashboard(req).await,
-        ("GET", "/api/v1/history") => handle_history(req).await,
-        ("GET", "/api/v1/calendar") => handle_calendar(req).await,
-        _ => Err(AppError::Internal("Not found".into()).into()),
+    let result = match method {
+        "GET" if path.ends_with("/dashboard") => handle_dashboard(req).await,
+        "GET" if path.ends_with("/history") => handle_history(req).await,
+        "GET" if path.ends_with("/calendar") => handle_calendar(req).await,
+        _ => Err(AppError::Internal("Not found".into())),
+    };
+
+    match result {
+        Ok(resp) => Ok(resp),
+        Err(e) => Ok(app_error_response(e)),
     }
 }
 
-async fn handle_dashboard(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_dashboard(req: Request) -> Result<Response<Body>, AppError> {
     let user_id = extract_user_id(&req)?;
     let table = get_table_name()?;
     let client = get_client().await;
@@ -38,7 +35,7 @@ async fn handle_dashboard(req: Request) -> Result<Response<Body>, Box<dyn std::e
         get_continue_watching(&client, &table, &user_id),
         get_upcoming(&client, &table, &user_id),
         get_recent_history(&client, &table, &user_id),
-    )?;
+    ).map_err(|e| AppError::Internal(e.to_string()))?;
 
     let response = shared::models::dashboard::DashboardResponse {
         continue_watching,
@@ -46,14 +43,19 @@ async fn handle_dashboard(req: Request) -> Result<Response<Body>, Box<dyn std::e
         recent_history,
     };
 
-    Ok(Response::builder()
+    let body = serde_json::to_string(&response)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let mut resp = Response::builder()
         .status(200)
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&response)?))
-        .unwrap())
+        .body(Body::from(body))
+        .unwrap();
+    add_cors(&mut resp);
+    Ok(resp)
 }
 
-async fn handle_history(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_history(req: Request) -> Result<Response<Body>, AppError> {
     let user_id = extract_user_id(&req)?;
     let table = get_table_name()?;
     let client = get_client().await;
@@ -73,16 +75,22 @@ async fn handle_history(req: Request) -> Result<Response<Body>, Box<dyn std::err
         .unwrap_or(20)
         .min(100);
 
-    let response = get_history_page(&client, &table, &user_id, cursor, limit).await?;
+    let response = get_history_page(&client, &table, &user_id, cursor, limit).await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Response::builder()
+    let body = serde_json::to_string(&response)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let mut resp = Response::builder()
         .status(200)
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&response)?))
-        .unwrap())
+        .body(Body::from(body))
+        .unwrap();
+    add_cors(&mut resp);
+    Ok(resp)
 }
 
-async fn handle_calendar(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_calendar(req: Request) -> Result<Response<Body>, AppError> {
     let user_id = extract_user_id(&req)?;
     let table = get_table_name()?;
     let client = get_client().await;
@@ -112,18 +120,24 @@ async fn handle_calendar(req: Request) -> Result<Response<Body>, Box<dyn std::er
         };
         (from, next_month)
     } else {
-        return error_response(400, "INVALID_PARAMS", "month parameter required (YYYY-MM)");
+        return Err(AppError::Internal("month parameter required (YYYY-MM)".into()));
     };
 
-    let calendar_days = get_calendar(&client, &table, &user_id, &from, &to).await?;
+    let calendar_days = get_calendar(&client, &table, &user_id, &from, &to).await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let response = shared::models::dashboard::CalendarResponse {
         items: calendar_days,
     };
 
-    Ok(Response::builder()
+    let body = serde_json::to_string(&response)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let mut resp = Response::builder()
         .status(200)
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&response)?))
-        .unwrap())
+        .body(Body::from(body))
+        .unwrap();
+    add_cors(&mut resp);
+    Ok(resp)
 }

@@ -1,8 +1,9 @@
 use lambda_http::{Body, Request, Response};
 use shared::auth::extract_user_id;
 use shared::db;
-use shared::error::AppError;
+use shared::error::{AppError, app_error_response, add_cors};
 use shared::models::progress::{MarkWatchedRequest, ProgressResponse, EpisodeProgress, SeriesProgress};
+use serde_json::json;
 
 fn parse_episode_id(path: &str) -> Option<&str> {
     let prefix = "/api/v1/episodes/";
@@ -11,36 +12,36 @@ fn parse_episode_id(path: &str) -> Option<&str> {
     rest.strip_suffix(suffix)
 }
 
-fn ok_response(status: u16, body: String) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap())
-}
-
 pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
-    let user_id = extract_user_id(&req)?;
-    let method = req.method().as_str().to_string();
-    let path = req.uri().path().to_string();
+    let method = req.method().as_str();
+    let path = req.uri().path();
 
-    let table = std::env::var("DYNAMODB_TABLE_NAME")
-        .unwrap_or_else(|_| "EpisodicEpisodes".to_string());
-    let client = db::get_client().await;
-
-    match (method.as_str(), path.as_str()) {
-        (method, _) if method == "GET" && parse_episode_id(&path).is_some() => {
-            let episode_id = parse_episode_id(&path).unwrap();
+    let result = match method {
+        "GET" if parse_episode_id(path).is_some() => {
+            let user_id = extract_user_id(&req)?;
+            let episode_id = parse_episode_id(path).unwrap();
+            let table = std::env::var("DYNAMODB_TABLE_NAME")
+                .unwrap_or_else(|_| "EpisodicEpisodes".to_string());
+            let client = db::get_client().await;
             handle_get_progress(&client, &table, &user_id, episode_id).await
         }
-        (method, _) if method == "PUT" && parse_episode_id(&path).is_some() => {
-            let episode_id = parse_episode_id(&path).unwrap();
+        "PUT" if parse_episode_id(path).is_some() => {
+            let user_id = extract_user_id(&req)?;
+            let episode_id = parse_episode_id(path).unwrap();
             let body = req.body();
             let request: MarkWatchedRequest = serde_json::from_slice(body.as_ref())
                 .map_err(|_| AppError::Internal("Invalid request body".into()))?;
+            let table = std::env::var("DYNAMODB_TABLE_NAME")
+                .unwrap_or_else(|_| "EpisodicEpisodes".to_string());
+            let client = db::get_client().await;
             handle_put_progress(&client, &table, &user_id, episode_id, request).await
         }
-        _ => Err(AppError::Internal("Not found".into()).into()),
+        _ => Err(AppError::Internal("Not found".into())),
+    };
+
+    match result {
+        Ok(resp) => Ok(resp),
+        Err(e) => Ok(app_error_response(e)),
     }
 }
 
@@ -49,7 +50,7 @@ async fn handle_get_progress(
     table: &str,
     user_id: &str,
     episode_id: &str,
-) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Response<Body>, AppError> {
     let (series_id, season_number, episode_number) = db::get_episode_by_id(client, table, episode_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -103,7 +104,16 @@ async fn handle_get_progress(
         next_episode,
     };
 
-    ok_response(200, serde_json::to_string(&response).unwrap())
+    let body = serde_json::to_string(&response)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let mut resp = Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    add_cors(&mut resp);
+    Ok(resp)
 }
 
 async fn handle_put_progress(
@@ -112,7 +122,7 @@ async fn handle_put_progress(
     user_id: &str,
     episode_id: &str,
     request: MarkWatchedRequest,
-) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Response<Body>, AppError> {
     let (series_id, season_number, episode_number) = db::get_episode_by_id(client, table, episode_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -131,14 +141,30 @@ async fn handle_put_progress(
         let response = build_progress_response(
             client, table, user_id, episode_id, &series_id, season_number, episode_number,
         ).await?;
-        return ok_response(200, serde_json::to_string(&response).unwrap());
+        let body = serde_json::to_string(&response)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let mut resp = Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        add_cors(&mut resp);
+        return Ok(resp);
     }
 
     if !request.watched && !already_watched {
         let response = build_progress_response(
             client, table, user_id, episode_id, &series_id, season_number, episode_number,
         ).await?;
-        return ok_response(200, serde_json::to_string(&response).unwrap());
+        let body = serde_json::to_string(&response)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let mut resp = Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        add_cors(&mut resp);
+        return Ok(resp);
     }
 
     if request.watched {
@@ -161,7 +187,16 @@ async fn handle_put_progress(
         client, table, user_id, episode_id, &series_id, season_number, episode_number,
     ).await?;
 
-    ok_response(200, serde_json::to_string(&response).unwrap())
+    let body = serde_json::to_string(&response)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let mut resp = Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    add_cors(&mut resp);
+    Ok(resp)
 }
 
 async fn build_progress_response(
@@ -172,7 +207,7 @@ async fn build_progress_response(
     series_id: &str,
     season_number: i32,
     episode_number: i32,
-) -> Result<ProgressResponse, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ProgressResponse, AppError> {
     let progress = db::get_episode_progress(client, table, user_id, series_id, season_number, episode_number)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
