@@ -23,13 +23,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ulid = "1"
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", features = ["json"] }
-aws-config = "1"
-aws-sdk-dynamodb = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+aws-config = { version = "1", features = ["rustls"] }
+aws-sdk-dynamodb = { version = "1", features = ["rustls"] }
 jsonwebtoken = "9"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
 
 # Shared crate
 shared = { path = "crates/shared" }
