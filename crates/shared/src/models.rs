@@ -107,6 +107,7 @@ pub mod user {
     }
 
     #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct RefreshRequest {
         pub refresh_token: String,
     }
