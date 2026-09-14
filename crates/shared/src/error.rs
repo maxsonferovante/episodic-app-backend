@@ -72,3 +72,37 @@ impl serde::Serialize for AppError {
         body.serialize(serializer)
     }
 }
+
+pub fn cors_headers() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("Access-Control-Allow-Origin", "*"),
+        ("Access-Control-Allow-Headers", "Content-Type,Authorization"),
+        ("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS"),
+    ]
+}
+
+pub fn error_response(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> http::Response<lambda_http::Body> {
+    let body = json!({ "error": { "code": code, "message": message } });
+    let mut resp = http::Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(lambda_http::Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    add_cors(&mut resp);
+    resp
+}
+
+pub fn app_error_response(err: AppError) -> http::Response<lambda_http::Body> {
+    error_response(err.status_code(), err.code(), &err.to_string())
+}
+
+pub fn add_cors(resp: &mut http::Response<lambda_http::Body>) {
+    let headers = resp.headers_mut();
+    headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
+    headers.insert("Access-Control-Allow-Headers", "Content-Type,Authorization".parse().unwrap());
+    headers.insert("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS".parse().unwrap());
+}
