@@ -732,6 +732,48 @@ pub async fn get_cached_seasons(client: &Client, table: &str, tmdb_id: i64) -> R
     Ok(seasons)
 }
 
+pub async fn cache_seasons(
+    client: &Client,
+    table: &str,
+    tmdb_id: i64,
+    seasons: &[crate::models::season::Season],
+) -> Result<(), aws_sdk_dynamodb::Error> {
+    let expires_at = chrono::Utc::now().timestamp() + CACHE_TTL_MONTH;
+
+    for season in seasons {
+        let mut item = HashMap::new();
+        item.insert("PK".to_string(), AttributeValue::S(format!("SERIES#{}", tmdb_id)));
+        item.insert("SK".to_string(), AttributeValue::S(format!("SEASON#{:02}", season.season_number)));
+        item.insert("id".to_string(), AttributeValue::S(season.id.clone()));
+        item.insert("seriesId".to_string(), AttributeValue::S(season.series_id.clone()));
+        if let Some(tid) = season.tmdb_id {
+            item.insert("tmdbId".to_string(), AttributeValue::N(tid.to_string()));
+        }
+        item.insert("seasonNumber".to_string(), AttributeValue::N(season.season_number.to_string()));
+        item.insert("name".to_string(), AttributeValue::S(season.name.clone()));
+        if let Some(ref overview) = season.overview {
+            item.insert("overview".to_string(), AttributeValue::S(overview.clone()));
+        }
+        if let Some(ref poster_path) = season.poster_path {
+            item.insert("posterPath".to_string(), AttributeValue::S(poster_path.clone()));
+        }
+        if let Some(ref air_date) = season.air_date {
+            item.insert("airDate".to_string(), AttributeValue::S(air_date.clone()));
+        }
+        item.insert("episodeCount".to_string(), AttributeValue::N(season.episode_count.to_string()));
+        item.insert("expiresAt".to_string(), AttributeValue::N(expires_at.to_string()));
+
+        client
+            .put_item()
+            .table_name(table)
+            .set_item(Some(item))
+            .send()
+            .await?;
+    }
+
+    Ok(())
+}
+
 pub async fn get_cached_episodes(client: &Client, table: &str, series_tmdb_id: i64, season_number: i32) -> Result<Vec<crate::models::episode::Episode>, aws_sdk_dynamodb::Error> {
     let result = client
         .query()

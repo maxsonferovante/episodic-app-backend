@@ -93,7 +93,8 @@ async fn handle_series_details(path: &str) -> Result<Response<Body>, Box<dyn std
 
     if let Ok(Some(cached)) = db::get_cached_series(&client, &table, tmdb_id).await {
         let providers = db::get_cached_providers(&client, &table, tmdb_id).await.unwrap_or(None);
-        let body = build_series_response(&cached, providers);
+        let seasons = db::get_cached_seasons(&client, &table, tmdb_id).await.unwrap_or_default();
+        let body = build_series_response(&cached, providers, &seasons);
         let mut resp = Response::builder()
             .status(200)
             .header("content-type", "application/json")
@@ -159,7 +160,8 @@ async fn handle_series_details(path: &str) -> Result<Response<Body>, Box<dyn std
         let _ = db::cache_providers(&client, &table, tmdb_id, prov).await;
     }
 
-    let body = build_series_response(&series, providers);
+    let seasons = db::get_cached_seasons(&client, &table, tmdb_id).await.unwrap_or_default();
+    let body = build_series_response(&series, providers, &seasons);
     let mut resp = Response::builder()
         .status(200)
         .header("content-type", "application/json")
@@ -205,6 +207,8 @@ async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::
         air_date: s.air_date,
         episode_count: s.episode_count,
     }).collect();
+
+    let _ = db::cache_seasons(&client, &table, tmdb_id, &seasons).await;
 
     let body = json!({ "items": seasons });
     let mut resp = Response::builder()
@@ -284,7 +288,21 @@ fn detect_country() -> String {
     std::env::var("TMDB_COUNTRY").unwrap_or_else(|_| "US".to_string())
 }
 
-fn build_series_response(series: &Series, providers: Option<WatchProviders>) -> serde_json::Value {
+fn build_series_response(series: &Series, providers: Option<WatchProviders>, seasons: &[Season]) -> serde_json::Value {
+    let seasons_json: Vec<serde_json::Value> = seasons.iter().map(|s| {
+        json!({
+            "id": s.id,
+            "seriesId": s.series_id,
+            "tmdbId": s.tmdb_id,
+            "seasonNumber": s.season_number,
+            "name": s.name,
+            "overview": s.overview,
+            "posterPath": s.poster_path,
+            "airDate": s.air_date,
+            "episodeCount": s.episode_count,
+        })
+    }).collect();
+
     let mut resp = json!({
         "id": series.id,
         "tmdbId": series.tmdb_id,
@@ -298,12 +316,38 @@ fn build_series_response(series: &Series, providers: Option<WatchProviders>) -> 
         "status": series.status,
         "numberOfSeasons": series.number_of_seasons,
         "numberOfEpisodes": series.number_of_episodes,
+        "seasons": seasons_json,
     });
 
     if let Some(prov) = providers {
-        if let Ok(v) = serde_json::to_value(&prov) {
-            resp["watchProviders"] = v;
-        }
+        let flatrate = prov.flatrate.as_ref().map(|v| v.iter().map(|p| json!({
+            "providerId": p.provider_id,
+            "providerName": p.provider_name,
+            "logoPath": p.logo_path,
+        })).collect::<Vec<_>>());
+        let rent = prov.rent.as_ref().map(|v| v.iter().map(|p| json!({
+            "providerId": p.provider_id,
+            "providerName": p.provider_name,
+            "logoPath": p.logo_path,
+        })).collect::<Vec<_>>());
+        let buy = prov.buy.as_ref().map(|v| v.iter().map(|p| json!({
+            "providerId": p.provider_id,
+            "providerName": p.provider_name,
+            "logoPath": p.logo_path,
+        })).collect::<Vec<_>>());
+        let free = prov.free.as_ref().map(|v| v.iter().map(|p| json!({
+            "providerId": p.provider_id,
+            "providerName": p.provider_name,
+            "logoPath": p.logo_path,
+        })).collect::<Vec<_>>());
+
+        let mut providers_arr = Vec::new();
+        if let Some(items) = flatrate { providers_arr.extend(items); }
+        if let Some(items) = rent { providers_arr.extend(items); }
+        if let Some(items) = buy { providers_arr.extend(items); }
+        if let Some(items) = free { providers_arr.extend(items); }
+
+        resp["providers"] = json!(providers_arr);
     }
 
     resp
