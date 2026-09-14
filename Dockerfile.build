@@ -1,0 +1,32 @@
+FROM rust:1.96-alpine AS builder
+
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
+
+WORKDIR /app
+COPY . .
+
+RUN cargo build --release --target aarch64-unknown-linux-musl -p auth-lambda && \
+    cp target/aarch64-unknown-linux-musl/release/bootstrap /auth-bootstrap && \
+    cargo build --release --target aarch64-unknown-linux-musl -p catalog-lambda && \
+    cp target/aarch64-unknown-linux-musl/release/bootstrap /catalog-bootstrap && \
+    cargo build --release --target aarch64-unknown-linux-musl -p library-lambda && \
+    cp target/aarch64-unknown-linux-musl/release/bootstrap /library-bootstrap && \
+    cargo build --release --target aarch64-unknown-linux-musl -p progress-lambda && \
+    cp target/aarch64-unknown-linux-musl/release/bootstrap /progress-bootstrap && \
+    cargo build --release --target aarch64-unknown-linux-musl -p dashboard-lambda && \
+    cp target/aarch64-unknown-linux-musl/release/bootstrap /dashboard-bootstrap && \
+    cargo build --release --target aarch64-unknown-linux-musl -p sync-job && \
+    cp target/aarch64-unknown-linux-musl/release/bootstrap /sync-job-bootstrap
+
+FROM alpine:3.19
+
+RUN mkdir -p /out/auth /out/catalog /out/library /out/progress /out/dashboard /out/sync-job
+
+COPY --from=builder /auth-bootstrap /out/auth/bootstrap
+COPY --from=builder /catalog-bootstrap /out/catalog/bootstrap
+COPY --from=builder /library-bootstrap /out/library/bootstrap
+COPY --from=builder /progress-bootstrap /out/progress/bootstrap
+COPY --from=builder /dashboard-bootstrap /out/dashboard/bootstrap
+COPY --from=builder /sync-job-bootstrap /out/sync-job/bootstrap
+
+CMD ["sh", "-c", "cp -r /out/* /output/"]
