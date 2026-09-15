@@ -1,6 +1,6 @@
 use lambda_http::{Body, Request, Response};
 use shared::auth::extract_user_id;
-use shared::db::{get_client, get_library_item, add_to_library, remove_from_library, list_library, get_cached_series};
+use shared::db::{get_client, get_library_item, add_to_library, remove_from_library, list_library, get_cached_series, count_watched_in_series, get_series_total_episodes};
 use shared::error::{AppError, app_error_response as error_response, add_cors};
 use shared::id;
 use shared::models::library::LibraryItem;
@@ -67,6 +67,8 @@ async fn handle_list_library(req: Request) -> Result<Response<Body>, AppError> {
     let items_with_details = futures::future::join_all(body.into_iter().map(|mut item| {
         let client = &client;
         let table = &table;
+        let user_id = user_id.clone();
+        let series_id = item["seriesId"].as_str().unwrap_or("").to_string();
         let tmdb_id = item["tmdbId"].as_i64().unwrap_or(0);
         async move {
             if tmdb_id > 0 {
@@ -76,6 +78,23 @@ async fn handle_list_library(req: Request) -> Result<Response<Body>, AppError> {
                     item["firstAirDate"] = json!(series.first_air_date);
                 }
             }
+
+            // Watch progress for the card stats.
+            let watched = count_watched_in_series(client, table, &user_id, &series_id)
+                .await
+                .unwrap_or(0);
+            let total = get_series_total_episodes(client, table, &series_id)
+                .await
+                .unwrap_or(0);
+            let percentage = if total > 0 {
+                ((watched as f64 / total as f64) * 100.0).round() as i64
+            } else {
+                0
+            };
+            item["watchedEpisodes"] = json!(watched);
+            item["totalEpisodes"] = json!(total);
+            item["percentage"] = json!(percentage);
+
             item
         }
     })).await;
