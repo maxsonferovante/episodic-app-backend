@@ -48,6 +48,7 @@ pub mod season {
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct Season {
         pub id: String,
         pub series_id: String,
@@ -65,6 +66,7 @@ pub mod episode {
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct Episode {
         pub id: String,
         pub series_id: String,
@@ -77,6 +79,9 @@ pub mod episode {
         pub air_date: Option<String>,
         pub runtime: Option<i32>,
         pub vote_average: Option<f64>,
+        /// Per-user watch status, merged when the caller is authenticated.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
     }
 }
 
@@ -141,6 +146,26 @@ pub mod progress {
         Upcoming,
     }
 
+    impl WatchStatus {
+        /// Canonical DynamoDB string for this status.
+        pub const fn as_str(&self) -> &'static str {
+            match self {
+                WatchStatus::Watched => crate::enums::watch_status::WATCHED,
+                WatchStatus::Unwatched => crate::enums::watch_status::UNWATCHED,
+                WatchStatus::Upcoming => crate::enums::watch_status::UPCOMING,
+            }
+        }
+
+        /// Parse a status stored in DynamoDB, defaulting to `Unwatched`.
+        pub fn from_db(value: &str) -> WatchStatus {
+            match value {
+                crate::enums::watch_status::WATCHED => WatchStatus::Watched,
+                crate::enums::watch_status::UPCOMING => WatchStatus::Upcoming,
+                _ => WatchStatus::Unwatched,
+            }
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct WatchProgress {
         pub user_id: String,
@@ -160,18 +185,23 @@ pub mod progress {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct EpisodeProgress {
         pub episode_id: String,
         pub status: WatchStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub watched_at: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct SeriesProgress {
         pub series_percentage: f64,
         pub season_percentage: f64,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct NextEpisode {
         pub episode_id: String,
         pub series_id: String,
@@ -180,6 +210,7 @@ pub mod progress {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct ProgressResponse {
         pub episode: EpisodeProgress,
         pub progress: SeriesProgress,

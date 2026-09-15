@@ -335,6 +335,14 @@ async fn write_episodes(
         item.insert("episodeNumber".to_string(), AttributeValue::N(ep.episode_number.to_string()));
         item.insert("name".to_string(), AttributeValue::S(ep.name.clone()));
 
+        // Stable episode id + GSI1 index so the progress lambda can resolve it.
+        let episode_id = format!("epi_{}", ep.id);
+        item.insert("id".to_string(), AttributeValue::S(episode_id.clone()));
+        item.insert("GSI1PK".to_string(), AttributeValue::S(episode_id.clone()));
+        item.insert("GSI1SK".to_string(), AttributeValue::S(format!("EPI#{}", episode_id)));
+        item.insert("seriesId".to_string(), AttributeValue::S(series_id.to_string()));
+        item.insert("seasonId".to_string(), AttributeValue::S(format!("sea_{}", season.season_number)));
+
         if let Some(ref o) = ep.overview {
             item.insert("overview".to_string(), AttributeValue::S(o.clone()));
         }

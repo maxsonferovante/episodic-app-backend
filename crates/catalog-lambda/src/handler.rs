@@ -220,7 +220,10 @@ async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::
     Ok(resp)
 }
 
-async fn handle_season_detail(path: &str) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_season_detail(
+    path: &str,
+    user_id: Option<String>,
+) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() < 7 {
         return Ok(error_response(AppError::Internal("Invalid path".into())));
@@ -232,43 +235,50 @@ async fn handle_season_detail(path: &str) -> Result<Response<Body>, Box<dyn std:
     let table = std::env::var("DYNAMODB_TABLE_NAME").unwrap_or_else(|_| "episodic".to_string());
     let client = db::get_client().await;
 
-    if let Ok(cached) = db::get_cached_episodes(&client, &table, tmdb_id, season_number).await {
-        if !cached.is_empty() {
-            let body = json!({
-                "seasonNumber": season_number,
-                "episodes": cached,
-            });
-            let mut resp = Response::builder()
-                .status(200)
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap();
-            add_cors(&mut resp);
-            return Ok(resp);
-        }
-    }
+    let series_id = format!("ser_{}", tmdb_id);
+    let season_id = format!("sea_{}_{}", tmdb_id, season_number);
 
-    let detail = match crate::tmdb::get_tv_season_detail(tmdb_id, season_number).await {
-        Ok(d) => d,
-        Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB season detail failed: {}", e)))),
+    // Resolve episodes from cache, falling back to TMDB.
+    let mut episodes = match db::get_cached_episodes(&client, &table, tmdb_id, season_number).await {
+        Ok(cached) if !cached.is_empty() => cached,
+        _ => {
+            let detail = match crate::tmdb::get_tv_season_detail(tmdb_id, season_number).await {
+                Ok(d) => d,
+                Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB season detail failed: {}", e)))),
+            };
+
+            detail.episodes.into_iter().map(|e| Episode {
+                id: format!("epi_{}", e.id),
+                series_id: series_id.clone(),
+                season_id: season_id.clone(),
+                tmdb_id: Some(e.id),
+                episode_number: e.episode_number,
+                name: e.name,
+                overview: e.overview,
+                still_path: e.still_path,
+                air_date: e.air_date,
+                runtime: e.runtime,
+                vote_average: e.vote_average,
+                status: None,
+            }).collect()
+        }
     };
 
-    let season_id = id::generate("sea");
-    let series_id = format!("ser_{}", tmdb_id);
+    // Persist (upsert) so episode ids stay resolvable on GSI1 for the progress
+    // lambda, and so season episode counts exist for percentage maths.
+    let _ = db::upsert_episodes(&client, &table, &series_id, &season_id, season_number, &episodes).await;
+    let _ = db::upsert_season_meta(&client, &table, &series_id, season_number, episodes.len() as i32).await;
 
-    let episodes: Vec<Episode> = detail.episodes.into_iter().map(|e| Episode {
-        id: id::generate("epi"),
-        series_id: series_id.clone(),
-        season_id: season_id.clone(),
-        tmdb_id: Some(e.id),
-        episode_number: e.episode_number,
-        name: e.name,
-        overview: e.overview,
-        still_path: e.still_path,
-        air_date: e.air_date,
-        runtime: e.runtime,
-        vote_average: e.vote_average,
-    }).collect();
+    // Merge the caller's watch status when authenticated.
+    if let Some(user_id) = user_id {
+        if let Ok(watched) = db::get_watched_set(&client, &table, &user_id, &series_id).await {
+            for ep in episodes.iter_mut() {
+                if watched.contains(&(season_number, ep.episode_number)) {
+                    ep.status = Some(shared::enums::watch_status::WATCHED.to_string());
+                }
+            }
+        }
+    }
 
     let body = json!({
         "seasonNumber": season_number,
@@ -372,7 +382,8 @@ pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std:
     }
 
     if path.matches('/').count() == 6 && path.contains("/seasons/") {
-        return handle_season_detail(&path).await;
+        let user_id = shared::auth::extract_user_id(&req).ok();
+        return handle_season_detail(&path, user_id).await;
     }
 
     if path.starts_with("/api/v1/series/") && path.matches('/').count() == 4 {

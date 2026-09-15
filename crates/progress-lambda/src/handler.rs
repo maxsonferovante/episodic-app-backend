@@ -61,8 +61,10 @@ async fn handle_get_progress(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let status = progress
-        .map(|p| p.status)
+        .as_ref()
+        .map(|p| p.status.clone())
         .unwrap_or(shared::models::progress::WatchStatus::Unwatched);
+    let watched_at = progress.as_ref().and_then(|p| p.watched_at.clone());
 
     let watched_count = db::count_watched_in_series(client, table, user_id, &series_id)
         .await
@@ -96,6 +98,7 @@ async fn handle_get_progress(
         episode: EpisodeProgress {
             episode_id: episode_id.to_string(),
             status,
+            watched_at,
         },
         progress: SeriesProgress {
             series_percentage: (series_pct * 10.0).round() / 10.0,
@@ -171,14 +174,14 @@ async fn handle_put_progress(
         db::mark_episode(client, table, user_id, &series_id, season_number, episode_number)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        db::create_watch_event(client, table, user_id, episode_id, "MARK_WATCHED")
+        db::create_watch_event(client, table, user_id, episode_id, shared::enums::watch_event_type::MARK_WATCHED)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
     } else {
         db::unmark_episode(client, table, user_id, &series_id, season_number, episode_number)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        db::create_watch_event(client, table, user_id, episode_id, "UNMARK_WATCHED")
+        db::create_watch_event(client, table, user_id, episode_id, shared::enums::watch_event_type::UNMARK_WATCHED)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
     }
@@ -213,8 +216,10 @@ async fn build_progress_response(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let status = progress
-        .map(|p| p.status)
+        .as_ref()
+        .map(|p| p.status.clone())
         .unwrap_or(shared::models::progress::WatchStatus::Unwatched);
+    let watched_at = progress.as_ref().and_then(|p| p.watched_at.clone());
 
     let watched_count = db::count_watched_in_series(client, table, user_id, series_id)
         .await
@@ -248,6 +253,7 @@ async fn build_progress_response(
         episode: EpisodeProgress {
             episode_id: episode_id.to_string(),
             status,
+            watched_at,
         },
         progress: SeriesProgress {
             series_percentage: (series_pct * 10.0).round() / 10.0,
