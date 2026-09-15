@@ -25,6 +25,16 @@ fn parse_season_path(path: &str) -> Option<(&str, i32)> {
     Some((series_id, season_number))
 }
 
+/// Canonicalise a series id to the stored `ser_<tmdb>` form, accepting either
+/// `1399` or `ser_1399`.
+fn normalize_series_id(series_id: &str) -> String {
+    if series_id.starts_with("ser_") {
+        series_id.to_string()
+    } else {
+        format!("ser_{}", series_id)
+    }
+}
+
 pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
     let method = req.method().as_str();
     let path = req.uri().path();
@@ -234,15 +244,16 @@ async fn handle_season_progress(
     season_number: i32,
     watched: bool,
 ) -> Result<Response<Body>, AppError> {
-    let episodes = db::list_season_episode_numbers(client, table, series_id, season_number)
+    let series_id = normalize_series_id(series_id);
+    let episodes = db::list_season_episode_numbers(client, table, &series_id, season_number)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     for episode_number in &episodes {
         let result = if watched {
-            db::mark_episode(client, table, user_id, series_id, season_number, *episode_number).await
+            db::mark_episode(client, table, user_id, &series_id, season_number, *episode_number).await
         } else {
-            db::unmark_episode(client, table, user_id, series_id, season_number, *episode_number).await
+            db::unmark_episode(client, table, user_id, &series_id, season_number, *episode_number).await
         };
         result.map_err(|e| AppError::Internal(e.to_string()))?;
     }
