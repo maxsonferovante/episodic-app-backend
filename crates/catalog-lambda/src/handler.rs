@@ -86,7 +86,7 @@ async fn handle_search(req: Request) -> Result<Response<Body>, Box<dyn std::erro
     Ok(resp)
 }
 
-async fn handle_series_details(path: &str) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
     let tmdb_id = extract_series_id(path, "/api/v1/series/")
         .ok_or_else(|| AppError::Internal("Invalid series ID".into()))?;
 
@@ -180,7 +180,32 @@ async fn handle_series_details(path: &str) -> Result<Response<Body>, Box<dyn std
         }
     }
 
-    let body = build_series_response(&series, providers, &seasons);
+    // 3. Watch progress: overall and per season, so the UI never has to fetch
+    //    every season to compute a series percentage.
+    let series_id = format!("ser_{}", tmdb_id);
+    let total_episodes = db::get_series_total_episodes(&client, &table, &series_id)
+        .await
+        .unwrap_or(0);
+
+    let mut watched_by_season: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    let mut watched_episodes = 0;
+    if let Some(user_id) = user_id {
+        if let Ok(watched) = db::get_watched_set(&client, &table, &user_id, &series_id).await {
+            watched_episodes = watched.len() as i32;
+            for (season, _episode) in watched {
+                *watched_by_season.entry(season).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let body = build_series_response(
+        &series,
+        providers,
+        &seasons,
+        &watched_by_season,
+        watched_episodes,
+        total_episodes,
+    );
     let mut resp = Response::builder()
         .status(200)
         .header("content-type", "application/json")
@@ -322,7 +347,14 @@ fn detect_country() -> String {
     std::env::var("TMDB_COUNTRY").unwrap_or_else(|_| "US".to_string())
 }
 
-fn build_series_response(series: &Series, providers: Option<WatchProviders>, seasons: &[Season]) -> serde_json::Value {
+fn build_series_response(
+    series: &Series,
+    providers: Option<WatchProviders>,
+    seasons: &[Season],
+    watched_by_season: &std::collections::HashMap<i32, i32>,
+    watched_episodes: i32,
+    total_episodes: i32,
+) -> serde_json::Value {
     let seasons_json: Vec<serde_json::Value> = seasons.iter().map(|s| {
         json!({
             "id": s.id,
@@ -334,8 +366,15 @@ fn build_series_response(series: &Series, providers: Option<WatchProviders>, sea
             "posterPath": s.poster_path,
             "airDate": s.air_date,
             "episodeCount": s.episode_count,
+            "watchedEpisodes": watched_by_season.get(&s.season_number).copied().unwrap_or(0),
         })
     }).collect();
+
+    let percentage = if total_episodes > 0 {
+        ((watched_episodes as f64 / total_episodes as f64) * 100.0).round() as i64
+    } else {
+        0
+    };
 
     let mut resp = json!({
         "id": series.id,
@@ -351,6 +390,11 @@ fn build_series_response(series: &Series, providers: Option<WatchProviders>, sea
         "numberOfSeasons": series.number_of_seasons,
         "numberOfEpisodes": series.number_of_episodes,
         "seasons": seasons_json,
+        "progress": {
+            "watchedEpisodes": watched_episodes,
+            "totalEpisodes": total_episodes,
+            "percentage": percentage,
+        },
     });
 
     if let Some(prov) = providers {
@@ -411,7 +455,8 @@ pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std:
     }
 
     if path.starts_with("/api/v1/series/") && path.matches('/').count() == 4 {
-        return handle_series_details(&path).await;
+        let user_id = shared::auth::extract_user_id(&req).ok();
+        return handle_series_details(&path, user_id).await;
     }
 
     Ok(error_response(AppError::Internal("Not found".into())))

@@ -209,13 +209,22 @@ pub async fn list_season_episode_numbers(
 
 /// Series name + poster, preferring the synced series meta and falling back to
 /// the catalog cache keyed by TMDB id.
-async fn get_series_ref(
+/// Series display metadata.
+pub struct SeriesMeta {
+    pub name: String,
+    pub poster_path: Option<String>,
+    pub first_air_date: Option<String>,
+}
+
+/// Series metadata, preferring the synced meta and falling back to the catalog
+/// cache keyed by TMDB id.
+pub async fn get_series_meta(
     client: &Client,
     table: &str,
     series_id: &str,
-) -> Result<(String, Option<String>), aws_sdk_dynamodb::Error> {
+) -> Result<Option<SeriesMeta>, aws_sdk_dynamodb::Error> {
     if series_id.is_empty() {
-        return Ok((String::new(), None));
+        return Ok(None);
     }
 
     let meta = client
@@ -229,7 +238,11 @@ async fn get_series_ref(
     if let Some(item) = meta.item() {
         let name = get_str(item, "name").to_string();
         if !name.is_empty() {
-            return Ok((name, get_opt_str(item, "posterPath").map(str::to_string)));
+            return Ok(Some(SeriesMeta {
+                name,
+                poster_path: get_opt_str(item, "posterPath").map(str::to_string),
+                first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
+            }));
         }
     }
 
@@ -242,14 +255,27 @@ async fn get_series_ref(
             .send()
             .await?;
         if let Some(item) = cached.item() {
-            return Ok((
-                get_str(item, "name").to_string(),
-                get_opt_str(item, "posterPath").map(str::to_string),
-            ));
+            return Ok(Some(SeriesMeta {
+                name: get_str(item, "name").to_string(),
+                poster_path: get_opt_str(item, "posterPath").map(str::to_string),
+                first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
+            }));
         }
     }
 
-    Ok((String::new(), None))
+    Ok(None)
+}
+
+/// Name + poster convenience wrapper.
+async fn get_series_ref(
+    client: &Client,
+    table: &str,
+    series_id: &str,
+) -> Result<(String, Option<String>), aws_sdk_dynamodb::Error> {
+    Ok(match get_series_meta(client, table, series_id).await? {
+        Some(meta) => (meta.name, meta.poster_path),
+        None => (String::new(), None),
+    })
 }
 
 pub async fn get_episode_progress(
@@ -509,7 +535,26 @@ pub async fn get_series_total_episodes(
         .map(|item| get_i32(item, "numberOfEpisodes"))
         .unwrap_or(0);
 
-    Ok(count)
+    if count > 0 {
+        return Ok(count);
+    }
+
+    // Fall back to the catalog cache when the series hasn't been synced yet.
+    if let Some(tmdb_id) = series_id.strip_prefix("ser_").and_then(|s| s.parse::<i64>().ok()) {
+        let cached = client
+            .get_item()
+            .table_name(table)
+            .key("PK", AttributeValue::S(format!("SERIES#{}", tmdb_id)))
+            .key("SK", AttributeValue::S("META".to_string()))
+            .send()
+            .await?;
+        return Ok(cached
+            .item()
+            .map(|item| get_i32(item, "numberOfEpisodes"))
+            .unwrap_or(0));
+    }
+
+    Ok(0)
 }
 
 pub async fn get_next_unwatched_episode(
@@ -1066,6 +1111,9 @@ pub async fn get_library_item(
         user_id: user_id.to_string(),
         series_id: get_str(item, "seriesId").to_string(),
         added_at: get_str(item, "addedAt").to_string(),
+        name: get_opt_str(item, "name").map(str::to_string),
+        poster_path: get_opt_str(item, "posterPath").map(str::to_string),
+        first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
     }))
 }
 
@@ -1081,6 +1129,17 @@ pub async fn add_to_library(
     db_item.insert("seriesId".to_string(), AttributeValue::S(item.series_id.clone()));
     db_item.insert("addedAt".to_string(), AttributeValue::S(item.added_at.clone()));
     db_item.insert("GSI1PK".to_string(), AttributeValue::S(format!("SERIES#{}", item.series_id)));
+
+    // Snapshot of the series metadata at add time.
+    if let Some(ref name) = item.name {
+        db_item.insert("name".to_string(), AttributeValue::S(name.clone()));
+    }
+    if let Some(ref poster) = item.poster_path {
+        db_item.insert("posterPath".to_string(), AttributeValue::S(poster.clone()));
+    }
+    if let Some(ref first_air_date) = item.first_air_date {
+        db_item.insert("firstAirDate".to_string(), AttributeValue::S(first_air_date.clone()));
+    }
 
     client
         .put_item()
@@ -1129,6 +1188,9 @@ pub async fn list_library(
             user_id: user_id.to_string(),
             series_id: get_str(item, "seriesId").to_string(),
             added_at: get_str(item, "addedAt").to_string(),
+            name: get_opt_str(item, "name").map(str::to_string),
+            poster_path: get_opt_str(item, "posterPath").map(str::to_string),
+            first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
         }
     }).collect();
 

@@ -1,6 +1,6 @@
 use lambda_http::{Body, Request, Response};
 use shared::auth::extract_user_id;
-use shared::db::{get_client, get_library_item, add_to_library, remove_from_library, list_library, get_cached_series, count_watched_in_series, get_series_total_episodes};
+use shared::db::{get_client, get_library_item, add_to_library, remove_from_library, list_library, get_series_meta, count_watched_in_series, get_series_total_episodes};
 use shared::error::{AppError, app_error_response as error_response, add_cors};
 use shared::id;
 use shared::models::library::LibraryItem;
@@ -61,6 +61,9 @@ async fn handle_list_library(req: Request) -> Result<Response<Body>, AppError> {
             "seriesId": item.series_id,
             "tmdbId": tmdb_id,
             "addedAt": item.added_at,
+            "name": item.name,
+            "posterPath": item.poster_path,
+            "firstAirDate": item.first_air_date,
         })
     }).collect();
 
@@ -69,13 +72,13 @@ async fn handle_list_library(req: Request) -> Result<Response<Body>, AppError> {
         let table = &table;
         let user_id = user_id.clone();
         let series_id = item["seriesId"].as_str().unwrap_or("").to_string();
-        let tmdb_id = item["tmdbId"].as_i64().unwrap_or(0);
         async move {
-            if tmdb_id > 0 {
-                if let Ok(Some(series)) = get_cached_series(client, table, tmdb_id).await {
-                    item["name"] = json!(series.name);
-                    item["posterPath"] = json!(series.poster_path);
-                    item["firstAirDate"] = json!(series.first_air_date);
+            // Name/poster/year: stored snapshot first, then synced/catalog meta.
+            if item["name"].is_null() {
+                if let Ok(Some(meta)) = get_series_meta(client, table, &series_id).await {
+                    item["name"] = json!(meta.name);
+                    item["posterPath"] = json!(meta.poster_path);
+                    item["firstAirDate"] = json!(meta.first_air_date);
                 }
             }
 
@@ -108,6 +111,17 @@ async fn handle_list_library(req: Request) -> Result<Response<Body>, AppError> {
     Ok(resp)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddLibraryPayload {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    first_air_date: Option<String>,
+}
+
 async fn handle_add_to_library(req: Request) -> Result<Response<Body>, AppError> {
     let user_id = extract_user_id(&req)?;
     let path = req.uri().path();
@@ -119,46 +133,55 @@ async fn handle_add_to_library(req: Request) -> Result<Response<Body>, AppError>
 
     let series_id = normalize_series_id(raw_id);
 
+    // Optional metadata snapshot sent by the client (search / detail screen),
+    // so the library renders without waiting for the daily sync job.
+    let payload: Option<AddLibraryPayload> = serde_json::from_slice(req.body().as_ref()).ok();
+
     let table = get_table_name()?;
     let client = get_client().await;
 
     let existing = get_library_item(&client, &table, &user_id, &series_id).await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    if let Some(item) = existing {
-        let body = json!({
-            "id": item.id,
-            "seriesId": item.series_id,
-            "addedAt": item.added_at,
-        });
-
-        let mut resp = Response::builder()
-            .status(200)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        add_cors(&mut resp);
-        return Ok(resp);
-    }
-
-    let new_item = LibraryItem {
-        id: id::generate("lib"),
-        user_id: user_id.clone(),
-        series_id,
-        added_at: chrono::Utc::now().to_rfc3339(),
+    let mut item = match existing {
+        Some(item) => item,
+        None => LibraryItem {
+            id: id::generate("lib"),
+            user_id: user_id.clone(),
+            series_id: series_id.clone(),
+            added_at: chrono::Utc::now().to_rfc3339(),
+            name: None,
+            poster_path: None,
+            first_air_date: None,
+        },
     };
 
-    add_to_library(&client, &table, &new_item).await
+    if let Some(p) = payload {
+        if p.name.is_some() {
+            item.name = p.name;
+        }
+        if p.poster_path.is_some() {
+            item.poster_path = p.poster_path;
+        }
+        if p.first_air_date.is_some() {
+            item.first_air_date = p.first_air_date;
+        }
+    }
+
+    add_to_library(&client, &table, &item).await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let body = json!({
-        "id": new_item.id,
-        "seriesId": new_item.series_id,
-        "addedAt": new_item.added_at,
+        "id": item.id,
+        "seriesId": item.series_id,
+        "addedAt": item.added_at,
+        "name": item.name,
+        "posterPath": item.poster_path,
+        "firstAirDate": item.first_air_date,
     });
 
     let mut resp = Response::builder()
-        .status(201)
+        .status(200)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();

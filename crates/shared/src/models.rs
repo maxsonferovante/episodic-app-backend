@@ -133,6 +133,14 @@ pub mod library {
         pub user_id: String,
         pub series_id: String,
         pub added_at: String,
+        /// Snapshot of the series metadata at the moment it was added, so the
+        /// library renders immediately without waiting for the sync job.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub poster_path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub first_air_date: Option<String>,
     }
 }
 
