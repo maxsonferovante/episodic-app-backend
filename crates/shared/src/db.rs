@@ -106,6 +106,7 @@ pub async fn create_user(client: &Client, table: &str, user: &User) -> Result<()
     item.insert("PK".to_string(), AttributeValue::S(format!("USR#{}", user.id)));
     item.insert("SK".to_string(), AttributeValue::S("PROFILE".to_string()));
     item.insert("GSI1PK".to_string(), AttributeValue::S(format!("EMAIL#{}", user.email)));
+    item.insert("GSI1SK".to_string(), AttributeValue::S(user.email.clone()));
     item.insert("email".to_string(), AttributeValue::S(user.email.clone()));
     item.insert("name".to_string(), AttributeValue::S(user.name.clone()));
     item.insert("provider".to_string(), AttributeValue::S(user.provider.clone()));
