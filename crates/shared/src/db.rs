@@ -174,13 +174,16 @@ async fn get_episode_item(
     Ok(result.item().cloned())
 }
 
-/// Episode numbers for a season, taken from the EP# rows.
+/// Episode numbers for a season that have already aired (airDate <= today), so
+/// bulk "mark season watched" never touches unaired episodes.
 pub async fn list_season_episode_numbers(
     client: &Client,
     table: &str,
     series_id: &str,
     season_number: i32,
 ) -> Result<Vec<i32>, aws_sdk_dynamodb::Error> {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
     let result = client
         .query()
         .table_name(table)
@@ -193,6 +196,10 @@ pub async fn list_season_episode_numbers(
     let mut episodes: Vec<i32> = result
         .items()
         .iter()
+        .filter(|item| match get_opt_str(item, "airDate") {
+            Some(air_date) => air_date <= today.as_str(),
+            None => false,
+        })
         .map(|item| get_i32(item, "episodeNumber"))
         .filter(|n| *n > 0)
         .collect();
