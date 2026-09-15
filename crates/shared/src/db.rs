@@ -156,6 +156,69 @@ pub async fn get_episode_by_id(
     Ok(Some((series_id, season_number, episode_number)))
 }
 
+/// Direct read of an episode row (PK = SER#<series>, SK = EP#<ss>#<ee>).
+async fn get_episode_item(
+    client: &Client,
+    table: &str,
+    series_id: &str,
+    season_number: i32,
+    episode_number: i32,
+) -> Result<Option<HashMap<String, AttributeValue>>, aws_sdk_dynamodb::Error> {
+    let result = client
+        .get_item()
+        .table_name(table)
+        .key("PK", AttributeValue::S(format!("SER#{}", series_id)))
+        .key("SK", AttributeValue::S(format!("EP#{:02}#{:02}", season_number, episode_number)))
+        .send()
+        .await?;
+    Ok(result.item().cloned())
+}
+
+/// Series name + poster, preferring the synced series meta and falling back to
+/// the catalog cache keyed by TMDB id.
+async fn get_series_ref(
+    client: &Client,
+    table: &str,
+    series_id: &str,
+) -> Result<(String, Option<String>), aws_sdk_dynamodb::Error> {
+    if series_id.is_empty() {
+        return Ok((String::new(), None));
+    }
+
+    let meta = client
+        .get_item()
+        .table_name(table)
+        .key("PK", AttributeValue::S(format!("SER#{}", series_id)))
+        .key("SK", AttributeValue::S("META".to_string()))
+        .send()
+        .await?;
+
+    if let Some(item) = meta.item() {
+        let name = get_str(item, "name").to_string();
+        if !name.is_empty() {
+            return Ok((name, get_opt_str(item, "posterPath").map(str::to_string)));
+        }
+    }
+
+    if let Some(tmdb_id) = series_id.strip_prefix("ser_").and_then(|s| s.parse::<i64>().ok()) {
+        let cached = client
+            .get_item()
+            .table_name(table)
+            .key("PK", AttributeValue::S(format!("SERIES#{}", tmdb_id)))
+            .key("SK", AttributeValue::S("META".to_string()))
+            .send()
+            .await?;
+        if let Some(item) = cached.item() {
+            return Ok((
+                get_str(item, "name").to_string(),
+                get_opt_str(item, "posterPath").map(str::to_string),
+            ));
+        }
+    }
+
+    Ok((String::new(), None))
+}
+
 pub async fn get_episode_progress(
     client: &Client,
     table: &str,
@@ -280,6 +343,32 @@ pub async fn create_watch_event(
     item.insert("episodeId".to_string(), AttributeValue::S(episode_id.to_string()));
     item.insert("eventType".to_string(), AttributeValue::S(event_type.to_string()));
     item.insert("occurredAt".to_string(), AttributeValue::S(now.to_rfc3339()));
+
+    // Enrich the event so history reads don't need extra lookups.
+    if let Ok(Some((series_id, season_number, episode_number))) =
+        get_episode_by_id(client, table, episode_id).await
+    {
+        let mut episode_name = String::new();
+        if let Ok(Some(ep)) = get_episode_item(client, table, &series_id, season_number, episode_number).await {
+            episode_name = get_str(&ep, "name").to_string();
+        }
+        let (series_name, poster_path) = get_series_ref(client, table, &series_id)
+            .await
+            .unwrap_or((String::new(), None));
+
+        item.insert("seriesId".to_string(), AttributeValue::S(series_id));
+        item.insert("seasonNumber".to_string(), AttributeValue::N(season_number.to_string()));
+        item.insert("episodeNumber".to_string(), AttributeValue::N(episode_number.to_string()));
+        if !episode_name.is_empty() {
+            item.insert("episodeName".to_string(), AttributeValue::S(episode_name));
+        }
+        if !series_name.is_empty() {
+            item.insert("seriesName".to_string(), AttributeValue::S(series_name));
+        }
+        if let Some(p) = poster_path {
+            item.insert("posterPath".to_string(), AttributeValue::S(p));
+        }
+    }
 
     client
         .put_item()
@@ -1043,8 +1132,17 @@ pub async fn get_continue_watching(client: &Client, table: &str, user_id: &str) 
 
     for item in items {
         let series_id = get_str(item, "seriesId").to_string();
-        let series_name = get_str(item, "seriesName").to_string();
-        let poster_path = get_opt_str(item, "posterPath").map(|s| s.to_string());
+        let mut series_name = get_str(item, "seriesName").to_string();
+        let mut poster_path = get_opt_str(item, "posterPath").map(|s| s.to_string());
+        if series_name.is_empty() || poster_path.is_none() {
+            let (name, poster) = get_series_ref(client, table, &series_id).await?;
+            if series_name.is_empty() {
+                series_name = name;
+            }
+            if poster_path.is_none() {
+                poster_path = poster;
+            }
+        }
         let percentage = get_num(item, "percentage");
 
         let next_episode_id = get_str(item, "nextEpisodeId").to_string();
@@ -1092,8 +1190,17 @@ pub async fn get_upcoming(client: &Client, table: &str, user_id: &str) -> Result
 
     for lib_item in lib_result.items() {
         let series_id = get_str(lib_item, "seriesId").to_string();
-        let series_name = get_str(lib_item, "seriesName").to_string();
-        let poster_path = get_opt_str(lib_item, "posterPath").map(|s| s.to_string());
+        let mut series_name = get_str(lib_item, "seriesName").to_string();
+        let mut poster_path = get_opt_str(lib_item, "posterPath").map(|s| s.to_string());
+        if series_name.is_empty() || poster_path.is_none() {
+            let (name, poster) = get_series_ref(client, table, &series_id).await?;
+            if series_name.is_empty() {
+                series_name = name;
+            }
+            if poster_path.is_none() {
+                poster_path = poster;
+            }
+        }
 
         let ep_result = client
             .query()
@@ -1138,6 +1245,67 @@ pub async fn get_upcoming(client: &Client, table: &str, user_id: &str) -> Result
     Ok(upcoming)
 }
 
+/// Resolved series/episode metadata for a watch event.
+struct WatchEventMeta {
+    episode_id: String,
+    series_id: String,
+    series_name: String,
+    poster_path: Option<String>,
+    episode_name: String,
+    season_number: i32,
+    episode_number: i32,
+}
+
+/// Resolve a watch event's metadata, filling any gaps from the episode/series
+/// tables (older events were written without names or coordinates).
+async fn resolve_watch_event(
+    client: &Client,
+    table: &str,
+    item: &HashMap<String, AttributeValue>,
+) -> Result<WatchEventMeta, aws_sdk_dynamodb::Error> {
+    let episode_id = get_str(item, "episodeId").to_string();
+    let mut series_id = get_str(item, "seriesId").to_string();
+    let mut series_name = get_str(item, "seriesName").to_string();
+    let mut episode_name = get_str(item, "episodeName").to_string();
+    let mut poster_path = get_opt_str(item, "posterPath").map(str::to_string);
+    let mut season_number = get_i32(item, "seasonNumber");
+    let mut episode_number = get_i32(item, "episodeNumber");
+
+    if series_id.is_empty() || season_number == 0 || episode_number == 0 {
+        if let Some((sid, sn, en)) = get_episode_by_id(client, table, &episode_id).await? {
+            series_id = sid;
+            season_number = sn;
+            episode_number = en;
+        }
+    }
+
+    if episode_name.is_empty() && !series_id.is_empty() && season_number > 0 && episode_number > 0 {
+        if let Some(ep) = get_episode_item(client, table, &series_id, season_number, episode_number).await? {
+            episode_name = get_str(&ep, "name").to_string();
+        }
+    }
+
+    if series_name.is_empty() || poster_path.is_none() {
+        let (name, poster) = get_series_ref(client, table, &series_id).await?;
+        if series_name.is_empty() {
+            series_name = name;
+        }
+        if poster_path.is_none() {
+            poster_path = poster;
+        }
+    }
+
+    Ok(WatchEventMeta {
+        episode_id,
+        series_id,
+        series_name,
+        poster_path,
+        episode_name,
+        season_number,
+        episode_number,
+    })
+}
+
 pub async fn get_recent_history(client: &Client, table: &str, user_id: &str) -> Result<Vec<HistoryItem>, aws_sdk_dynamodb::Error> {
     let result = client
         .query()
@@ -1154,26 +1322,20 @@ pub async fn get_recent_history(client: &Client, table: &str, user_id: &str) -> 
     let mut history = Vec::with_capacity(items.len());
 
     for item in items {
-        let episode_id = get_str(item, "episodeId").to_string();
-        let series_id = get_str(item, "seriesId").to_string();
-        let series_name = get_str(item, "seriesName").to_string();
-        let episode_name = get_str(item, "episodeName").to_string();
-        let season_number = get_i32(item, "seasonNumber");
-        let episode_number = get_i32(item, "episodeNumber");
         let watched_at = get_str(item, "occurredAt").to_string();
-        let poster_path = get_opt_str(item, "posterPath").map(|s| s.to_string());
+        let meta = resolve_watch_event(client, table, item).await?;
 
         history.push(HistoryItem {
             episode: EpisodeRef {
-                id: episode_id,
-                season_number,
-                episode_number,
-                name: episode_name,
+                id: meta.episode_id,
+                season_number: meta.season_number,
+                episode_number: meta.episode_number,
+                name: meta.episode_name,
             },
             series: SeriesRef {
-                id: series_id,
-                name: series_name,
-                poster_path,
+                id: meta.series_id,
+                name: meta.series_name,
+                poster_path: meta.poster_path,
             },
             watched_at,
         });
@@ -1216,29 +1378,23 @@ pub async fn get_history_page(
     let mut last_sk = None;
 
     for item in actual_items {
-        let episode_id = get_str(item, "episodeId").to_string();
-        let series_id = get_str(item, "seriesId").to_string();
-        let series_name = get_str(item, "seriesName").to_string();
-        let episode_name = get_str(item, "episodeName").to_string();
-        let season_number = get_i32(item, "seasonNumber");
-        let episode_number = get_i32(item, "episodeNumber");
         let watched_at = get_str(item, "occurredAt").to_string();
-        let poster_path = get_opt_str(item, "posterPath").map(|s| s.to_string());
         let sk = get_str(item, "SK").to_string();
+        let meta = resolve_watch_event(client, table, item).await?;
 
         last_sk = Some(sk);
 
         history.push(HistoryItem {
             episode: EpisodeRef {
-                id: episode_id,
-                season_number,
-                episode_number,
-                name: episode_name,
+                id: meta.episode_id,
+                season_number: meta.season_number,
+                episode_number: meta.episode_number,
+                name: meta.episode_name,
             },
             series: SeriesRef {
-                id: series_id,
-                name: series_name,
-                poster_path,
+                id: meta.series_id,
+                name: meta.series_name,
+                poster_path: meta.poster_path,
             },
             watched_at,
         });

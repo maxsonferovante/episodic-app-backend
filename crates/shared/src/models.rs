@@ -228,6 +228,7 @@ pub mod dashboard {
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct SeriesRef {
         pub id: String,
         pub name: String,
@@ -236,6 +237,7 @@ pub mod dashboard {
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct EpisodeRef {
         pub id: String,
         pub season_number: i32,
@@ -244,6 +246,7 @@ pub mod dashboard {
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct ContinueWatchingItem {
         pub series: SeriesRef,
         pub next_episode: EpisodeRef,
@@ -251,11 +254,13 @@ pub mod dashboard {
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct ProgressInfo {
         pub percentage: f64,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct UpcomingItem {
         pub series: SeriesRef,
         pub episode: EpisodeRef,
@@ -263,6 +268,7 @@ pub mod dashboard {
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct HistoryItem {
         pub episode: EpisodeRef,
         pub series: SeriesRef,
@@ -270,34 +276,36 @@ pub mod dashboard {
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct DashboardResponse {
-        #[serde(rename = "continueWatching")]
         pub continue_watching: Vec<ContinueWatchingItem>,
         pub upcoming: Vec<UpcomingItem>,
-        #[serde(rename = "recentHistory")]
         pub recent_history: Vec<HistoryItem>,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct HistoryResponse {
         pub items: Vec<HistoryItem>,
-        #[serde(rename = "nextCursor")]
         pub next_cursor: Option<String>,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct CalendarDay {
         pub date: String,
         pub episodes: Vec<CalendarEpisode>,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct CalendarEpisode {
         pub series: SeriesRef,
         pub episode: EpisodeRef,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct CalendarResponse {
         pub items: Vec<CalendarDay>,
     }
