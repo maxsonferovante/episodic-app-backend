@@ -174,6 +174,32 @@ async fn get_episode_item(
     Ok(result.item().cloned())
 }
 
+/// Episode numbers for a season, taken from the EP# rows.
+pub async fn list_season_episode_numbers(
+    client: &Client,
+    table: &str,
+    series_id: &str,
+    season_number: i32,
+) -> Result<Vec<i32>, aws_sdk_dynamodb::Error> {
+    let result = client
+        .query()
+        .table_name(table)
+        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
+        .expression_attribute_values(":pk", AttributeValue::S(format!("SER#{}", series_id)))
+        .expression_attribute_values(":sk_prefix", AttributeValue::S(format!("EP#{:02}#", season_number)))
+        .send()
+        .await?;
+
+    let mut episodes: Vec<i32> = result
+        .items()
+        .iter()
+        .map(|item| get_i32(item, "episodeNumber"))
+        .filter(|n| *n > 0)
+        .collect();
+    episodes.sort_unstable();
+    Ok(episodes)
+}
+
 /// Series name + poster, preferring the synced series meta and falling back to
 /// the catalog cache keyed by TMDB id.
 async fn get_series_ref(
@@ -1184,7 +1210,6 @@ pub async fn get_upcoming(client: &Client, table: &str, user_id: &str) -> Result
         .await?;
 
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let fourteen_days = (chrono::Utc::now() + chrono::Duration::days(14)).format("%Y-%m-%d").to_string();
 
     let mut upcoming = Vec::new();
 
@@ -1211,33 +1236,46 @@ pub async fn get_upcoming(client: &Client, table: &str, user_id: &str) -> Result
             .send()
             .await?;
 
+        // Only the next (earliest) upcoming episode per series.
+        let mut next: Option<(String, i32, i32, String, String)> = None;
         for ep_item in ep_result.items() {
             let air_date = match get_opt_str(ep_item, "airDate") {
                 Some(d) => d.to_string(),
                 None => continue,
             };
-
-            if air_date.as_str() >= today.as_str() && air_date.as_str() <= fourteen_days.as_str() {
-                let episode_id = get_str(ep_item, "id").to_string();
-                let season_number = get_i32(ep_item, "seasonNumber");
-                let episode_number = get_i32(ep_item, "episodeNumber");
-                let episode_name = get_str(ep_item, "name").to_string();
-
-                upcoming.push(UpcomingItem {
-                    series: SeriesRef {
-                        id: series_id.clone(),
-                        name: series_name.clone(),
-                        poster_path: poster_path.clone(),
-                    },
-                    episode: EpisodeRef {
-                        id: episode_id,
-                        season_number,
-                        episode_number,
-                        name: episode_name,
-                    },
-                    air_date,
-                });
+            if air_date.as_str() < today.as_str() {
+                continue;
             }
+            let is_earlier = match &next {
+                None => true,
+                Some((current, ..)) => air_date.as_str() < current.as_str(),
+            };
+            if is_earlier {
+                next = Some((
+                    air_date,
+                    get_i32(ep_item, "seasonNumber"),
+                    get_i32(ep_item, "episodeNumber"),
+                    get_str(ep_item, "id").to_string(),
+                    get_str(ep_item, "name").to_string(),
+                ));
+            }
+        }
+
+        if let Some((air_date, season_number, episode_number, episode_id, episode_name)) = next {
+            upcoming.push(UpcomingItem {
+                series: SeriesRef {
+                    id: series_id,
+                    name: series_name,
+                    poster_path,
+                },
+                episode: EpisodeRef {
+                    id: episode_id,
+                    season_number,
+                    episode_number,
+                    name: episode_name,
+                },
+                air_date,
+            });
         }
     }
 

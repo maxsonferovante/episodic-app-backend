@@ -12,29 +12,52 @@ fn parse_episode_id(path: &str) -> Option<&str> {
     rest.strip_suffix(suffix)
 }
 
+/// Matches `/api/v1/episodes/season/{seriesId}/{seasonNumber}/progress`.
+fn parse_season_path(path: &str) -> Option<(&str, i32)> {
+    let rest = path.strip_prefix("/api/v1/episodes/season/")?;
+    let rest = rest.strip_suffix("/progress")?;
+    let mut parts = rest.split('/');
+    let series_id = parts.next()?;
+    let season_number: i32 = parts.next()?.parse().ok()?;
+    if series_id.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some((series_id, season_number))
+}
+
 pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
     let method = req.method().as_str();
     let path = req.uri().path();
 
+    // Resolve auth once and answer properly (401) instead of letting the error
+    // escape handle_request, which made the runtime panic with a 502.
+    let user_id = match extract_user_id(&req) {
+        Ok(user_id) => user_id,
+        Err(e) => return Ok(app_error_response(e)),
+    };
+
+    let table = std::env::var("DYNAMODB_TABLE_NAME")
+        .unwrap_or_else(|_| "EpisodicEpisodes".to_string());
+    let client = db::get_client().await;
+
     let result = match method {
         "GET" if parse_episode_id(path).is_some() => {
-            let user_id = extract_user_id(&req)?;
             let episode_id = parse_episode_id(path).unwrap();
-            let table = std::env::var("DYNAMODB_TABLE_NAME")
-                .unwrap_or_else(|_| "EpisodicEpisodes".to_string());
-            let client = db::get_client().await;
             handle_get_progress(&client, &table, &user_id, episode_id).await
         }
+        "PUT" if parse_season_path(path).is_some() => {
+            let (series_id, season_number) = parse_season_path(path).unwrap();
+            match serde_json::from_slice::<MarkWatchedRequest>(req.body().as_ref()) {
+                Ok(request) => handle_season_progress(&client, &table, &user_id, series_id, season_number, request.watched).await,
+                Err(_) => Err(AppError::Internal("Invalid request body".into())),
+            }
+        }
         "PUT" if parse_episode_id(path).is_some() => {
-            let user_id = extract_user_id(&req)?;
             let episode_id = parse_episode_id(path).unwrap();
-            let body = req.body();
-            let request: MarkWatchedRequest = serde_json::from_slice(body.as_ref())
-                .map_err(|_| AppError::Internal("Invalid request body".into()))?;
-            let table = std::env::var("DYNAMODB_TABLE_NAME")
-                .unwrap_or_else(|_| "EpisodicEpisodes".to_string());
-            let client = db::get_client().await;
-            handle_put_progress(&client, &table, &user_id, episode_id, request).await
+            match serde_json::from_slice::<MarkWatchedRequest>(req.body().as_ref()) {
+                Ok(request) => handle_put_progress(&client, &table, &user_id, episode_id, request).await,
+                Err(_) => Err(AppError::Internal("Invalid request body".into())),
+            }
         }
         _ => Err(AppError::Internal("Not found".into())),
     };
@@ -197,6 +220,44 @@ async fn handle_put_progress(
         .status(200)
         .header("content-type", "application/json")
         .body(Body::from(body))
+        .unwrap();
+    add_cors(&mut resp);
+    Ok(resp)
+}
+
+/// Mark/unmark every episode of a season in one request.
+async fn handle_season_progress(
+    client: &db::Client,
+    table: &str,
+    user_id: &str,
+    series_id: &str,
+    season_number: i32,
+    watched: bool,
+) -> Result<Response<Body>, AppError> {
+    let episodes = db::list_season_episode_numbers(client, table, series_id, season_number)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    for episode_number in &episodes {
+        let result = if watched {
+            db::mark_episode(client, table, user_id, series_id, season_number, *episode_number).await
+        } else {
+            db::unmark_episode(client, table, user_id, series_id, season_number, *episode_number).await
+        };
+        result.map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+
+    let body = json!({
+        "seriesId": series_id,
+        "seasonNumber": season_number,
+        "watched": watched,
+        "updatedEpisodes": episodes.len(),
+    });
+
+    let mut resp = Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
         .unwrap();
     add_cors(&mut resp);
     Ok(resp)
