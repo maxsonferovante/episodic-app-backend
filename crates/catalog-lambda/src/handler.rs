@@ -20,12 +20,14 @@ fn parse_query_param(query: &str, key: &str) -> Option<String> {
     })
 }
 
+/// Parse a series identifier that may be either a bare TMDB id (`1399`) or the
+/// internal id (`ser_1399`).
+fn parse_tmdb_id(value: &str) -> Option<i64> {
+    value.strip_prefix("ser_").unwrap_or(value).parse::<i64>().ok()
+}
+
 fn extract_series_id(path: &str, prefix: &str) -> Option<i64> {
-    path.strip_prefix(prefix)?
-        .split('/')
-        .next()?
-        .parse::<i64>()
-        .ok()
+    parse_tmdb_id(path.strip_prefix(prefix)?.split('/').next()?)
 }
 
 async fn handle_search(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
@@ -251,7 +253,7 @@ async fn handle_season_detail(
         return Ok(error_response(AppError::Internal("Invalid path".into())));
     }
 
-    let tmdb_id: i64 = parts[4].parse().map_err(|_| AppError::Internal("Invalid series ID".into()))?;
+    let tmdb_id: i64 = parse_tmdb_id(parts[4]).ok_or_else(|| AppError::Internal("Invalid series ID".into()))?;
     let season_number: i32 = parts[6].parse().map_err(|_| AppError::Internal("Invalid season number".into()))?;
 
     let table = std::env::var("DYNAMODB_TABLE_NAME").unwrap_or_else(|_| "episodic".to_string());
