@@ -21,6 +21,7 @@ pub mod series {
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct CatalogSeries {
         pub id: i64,
         pub name: String,
