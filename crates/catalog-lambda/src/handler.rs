@@ -180,12 +180,23 @@ async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Re
         }
     }
 
-    // 3. Watch progress: overall and per season, so the UI never has to fetch
-    //    every season to compute a series percentage.
+    // 3. Watch progress over *aired* episodes only, so upcoming episodes don't
+    //    count against progress and the UI never fans out over every season.
     let series_id = format!("ser_{}", tmdb_id);
-    let total_episodes = db::get_series_total_episodes(&client, &table, &series_id)
+    let (aired_total, aired_by_season) = db::get_aired_counts(&client, &table, &series_id)
         .await
-        .unwrap_or(0);
+        .unwrap_or((0, std::collections::HashMap::new()));
+
+    let (total_episodes, season_totals) = if aired_total > 0 {
+        (aired_total, aired_by_season)
+    } else {
+        // No cached episodes yet: fall back to the known totals.
+        let total = db::get_series_total_episodes(&client, &table, &series_id)
+            .await
+            .unwrap_or(0);
+        let map = seasons.iter().map(|s| (s.season_number, s.episode_count)).collect();
+        (total, map)
+    };
 
     let mut watched_by_season: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
     let mut watched_episodes = 0;
@@ -203,6 +214,7 @@ async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Re
         providers,
         &seasons,
         &watched_by_season,
+        &season_totals,
         watched_episodes,
         total_episodes,
     );
@@ -352,6 +364,7 @@ fn build_series_response(
     providers: Option<WatchProviders>,
     seasons: &[Season],
     watched_by_season: &std::collections::HashMap<i32, i32>,
+    season_totals: &std::collections::HashMap<i32, i32>,
     watched_episodes: i32,
     total_episodes: i32,
 ) -> serde_json::Value {
@@ -366,12 +379,13 @@ fn build_series_response(
             "posterPath": s.poster_path,
             "airDate": s.air_date,
             "episodeCount": s.episode_count,
+            "airedEpisodes": season_totals.get(&s.season_number).copied().unwrap_or(s.episode_count),
             "watchedEpisodes": watched_by_season.get(&s.season_number).copied().unwrap_or(0),
         })
     }).collect();
 
     let percentage = if total_episodes > 0 {
-        ((watched_episodes as f64 / total_episodes as f64) * 100.0).round() as i64
+        (((watched_episodes as f64 / total_episodes as f64) * 100.0).round() as i64).min(100)
     } else {
         0
     };

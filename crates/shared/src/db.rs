@@ -214,6 +214,7 @@ pub struct SeriesMeta {
     pub name: String,
     pub poster_path: Option<String>,
     pub first_air_date: Option<String>,
+    pub status: Option<String>,
 }
 
 /// Series metadata, preferring the synced meta and falling back to the catalog
@@ -242,6 +243,7 @@ pub async fn get_series_meta(
                 name,
                 poster_path: get_opt_str(item, "posterPath").map(str::to_string),
                 first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
+                status: get_opt_str(item, "status").map(str::to_string),
             }));
         }
     }
@@ -259,6 +261,7 @@ pub async fn get_series_meta(
                 name: get_str(item, "name").to_string(),
                 poster_path: get_opt_str(item, "posterPath").map(str::to_string),
                 first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
+                status: get_opt_str(item, "status").map(str::to_string),
             }));
         }
     }
@@ -555,6 +558,38 @@ pub async fn get_series_total_episodes(
     }
 
     Ok(0)
+}
+
+/// Aired episodes (airDate <= today) for a series: total and per season.
+pub async fn get_aired_counts(
+    client: &Client,
+    table: &str,
+    series_id: &str,
+) -> Result<(i32, HashMap<i32, i32>), aws_sdk_dynamodb::Error> {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    let result = client
+        .query()
+        .table_name(table)
+        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
+        .expression_attribute_values(":pk", AttributeValue::S(format!("SER#{}", series_id)))
+        .expression_attribute_values(":sk_prefix", AttributeValue::S("EP#".to_string()))
+        .send()
+        .await?;
+
+    let mut by_season: HashMap<i32, i32> = HashMap::new();
+    let mut total = 0;
+    for item in result.items() {
+        if let Some(air_date) = get_opt_str(item, "airDate") {
+            if air_date <= today.as_str() {
+                let season = get_i32(item, "seasonNumber");
+                *by_season.entry(season).or_insert(0) += 1;
+                total += 1;
+            }
+        }
+    }
+
+    Ok((total, by_season))
 }
 
 pub async fn get_next_unwatched_episode(

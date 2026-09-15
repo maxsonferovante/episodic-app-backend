@@ -1,6 +1,6 @@
 use lambda_http::{Body, Request, Response};
 use shared::auth::extract_user_id;
-use shared::db::{get_client, get_library_item, add_to_library, remove_from_library, list_library, get_series_meta, count_watched_in_series, get_series_total_episodes};
+use shared::db::{get_client, get_library_item, add_to_library, remove_from_library, list_library, get_series_meta, count_watched_in_series, get_series_total_episodes, get_aired_counts};
 use shared::error::{AppError, app_error_response as error_response, add_cors};
 use shared::id;
 use shared::models::library::LibraryItem;
@@ -73,24 +73,36 @@ async fn handle_list_library(req: Request) -> Result<Response<Body>, AppError> {
         let user_id = user_id.clone();
         let series_id = item["seriesId"].as_str().unwrap_or("").to_string();
         async move {
-            // Name/poster/year: stored snapshot first, then synced/catalog meta.
-            if item["name"].is_null() {
+            // Name/poster/year/status: stored snapshot first, then synced/catalog meta.
+            if item["name"].is_null() || item["status"].is_null() {
                 if let Ok(Some(meta)) = get_series_meta(client, table, &series_id).await {
-                    item["name"] = json!(meta.name);
-                    item["posterPath"] = json!(meta.poster_path);
-                    item["firstAirDate"] = json!(meta.first_air_date);
+                    if item["name"].is_null() {
+                        item["name"] = json!(meta.name);
+                        item["posterPath"] = json!(meta.poster_path);
+                        item["firstAirDate"] = json!(meta.first_air_date);
+                    }
+                    if item["status"].is_null() {
+                        item["status"] = json!(meta.status);
+                    }
                 }
             }
 
-            // Watch progress for the card stats.
+            // Watch progress for the card stats (aired episodes only).
             let watched = count_watched_in_series(client, table, &user_id, &series_id)
                 .await
                 .unwrap_or(0);
-            let total = get_series_total_episodes(client, table, &series_id)
+            let (aired, _) = get_aired_counts(client, table, &series_id)
                 .await
-                .unwrap_or(0);
+                .unwrap_or((0, Default::default()));
+            let total = if aired > 0 {
+                aired
+            } else {
+                get_series_total_episodes(client, table, &series_id)
+                    .await
+                    .unwrap_or(0)
+            };
             let percentage = if total > 0 {
-                ((watched as f64 / total as f64) * 100.0).round() as i64
+                (((watched as f64 / total as f64) * 100.0).round() as i64).min(100)
             } else {
                 0
             };
