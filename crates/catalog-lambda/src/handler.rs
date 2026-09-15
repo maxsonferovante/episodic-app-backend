@@ -91,76 +91,93 @@ async fn handle_series_details(path: &str) -> Result<Response<Body>, Box<dyn std
     let table = std::env::var("DYNAMODB_TABLE_NAME").unwrap_or_else(|_| "episodic".to_string());
     let client = db::get_client().await;
 
-    if let Ok(Some(cached)) = db::get_cached_series(&client, &table, tmdb_id).await {
-        let providers = db::get_cached_providers(&client, &table, tmdb_id).await.unwrap_or(None);
-        let seasons = db::get_cached_seasons(&client, &table, tmdb_id).await.unwrap_or_default();
-        let body = build_series_response(&cached, providers, &seasons);
-        let mut resp = Response::builder()
-            .status(200)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        add_cors(&mut resp);
-        return Ok(resp);
-    }
+    // 1. Resolve the series itself (cache first, then TMDB).
+    let (series, providers) = match db::get_cached_series(&client, &table, tmdb_id).await {
+        Ok(Some(cached)) => {
+            let providers = db::get_cached_providers(&client, &table, tmdb_id).await.unwrap_or(None);
+            (cached, providers)
+        }
+        _ => {
+            let details = match crate::tmdb::get_tv_details(tmdb_id).await {
+                Ok(d) => d,
+                Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB details failed: {}", e)))),
+            };
 
-    let details = match crate::tmdb::get_tv_details(tmdb_id).await {
-        Ok(d) => d,
-        Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB details failed: {}", e)))),
+            let now = chrono::Utc::now().to_rfc3339();
+            let series = Series {
+                id: id::generate("ser"),
+                tmdb_id: details.id,
+                imdb_id: details.imdb_id,
+                name: details.name,
+                original_name: details.original_name,
+                overview: details.overview.unwrap_or_default(),
+                poster_path: details.poster_path,
+                backdrop_path: details.backdrop_path,
+                first_air_date: details.first_air_date,
+                last_air_date: details.last_air_date,
+                status: details.status.unwrap_or_default(),
+                number_of_seasons: details.number_of_seasons.unwrap_or(0),
+                number_of_episodes: details.number_of_episodes.unwrap_or(0),
+                created_at: now.clone(),
+                updated_at: now,
+            };
+
+            let _ = db::cache_series(&client, &table, &series).await;
+
+            let providers = details.watch_providers.and_then(|wp| wp.results).and_then(|r| {
+                let country = detect_country();
+                r.get(&country).map(|cp| WatchProviders {
+                    flatrate: cp.flatrate.as_ref().map(|v| v.iter().map(|p| Provider {
+                        provider_id: p.provider_id,
+                        provider_name: p.provider_name.clone(),
+                        logo_path: p.logo_path.clone(),
+                    }).collect()),
+                    rent: cp.rent.as_ref().map(|v| v.iter().map(|p| Provider {
+                        provider_id: p.provider_id,
+                        provider_name: p.provider_name.clone(),
+                        logo_path: p.logo_path.clone(),
+                    }).collect()),
+                    buy: cp.buy.as_ref().map(|v| v.iter().map(|p| Provider {
+                        provider_id: p.provider_id,
+                        provider_name: p.provider_name.clone(),
+                        logo_path: p.logo_path.clone(),
+                    }).collect()),
+                    free: cp.free.as_ref().map(|v| v.iter().map(|p| Provider {
+                        provider_id: p.provider_id,
+                        provider_name: p.provider_name.clone(),
+                        logo_path: p.logo_path.clone(),
+                    }).collect()),
+                })
+            });
+
+            if let Some(ref prov) = providers {
+                let _ = db::cache_providers(&client, &table, tmdb_id, prov).await;
+            }
+
+            (series, providers)
+        }
     };
 
-    let now = chrono::Utc::now().to_rfc3339();
-    let series = Series {
-        id: id::generate("ser"),
-        tmdb_id: details.id,
-        imdb_id: details.imdb_id,
-        name: details.name,
-        original_name: details.original_name,
-        overview: details.overview.unwrap_or_default(),
-        poster_path: details.poster_path,
-        backdrop_path: details.backdrop_path,
-        first_air_date: details.first_air_date,
-        last_air_date: details.last_air_date,
-        status: details.status.unwrap_or_default(),
-        number_of_seasons: details.number_of_seasons.unwrap_or(0),
-        number_of_episodes: details.number_of_episodes.unwrap_or(0),
-        created_at: now.clone(),
-        updated_at: now,
-    };
-
-    let _ = db::cache_series(&client, &table, &series).await;
-
-    let providers = details.watch_providers.and_then(|wp| wp.results).and_then(|r| {
-        let country = detect_country();
-        r.get(&country).map(|cp| WatchProviders {
-            flatrate: cp.flatrate.as_ref().map(|v| v.iter().map(|p| Provider {
-                provider_id: p.provider_id,
-                provider_name: p.provider_name.clone(),
-                logo_path: p.logo_path.clone(),
-            }).collect()),
-            rent: cp.rent.as_ref().map(|v| v.iter().map(|p| Provider {
-                provider_id: p.provider_id,
-                provider_name: p.provider_name.clone(),
-                logo_path: p.logo_path.clone(),
-            }).collect()),
-            buy: cp.buy.as_ref().map(|v| v.iter().map(|p| Provider {
-                provider_id: p.provider_id,
-                provider_name: p.provider_name.clone(),
-                logo_path: p.logo_path.clone(),
-            }).collect()),
-            free: cp.free.as_ref().map(|v| v.iter().map(|p| Provider {
-                provider_id: p.provider_id,
-                provider_name: p.provider_name.clone(),
-                logo_path: p.logo_path.clone(),
-            }).collect()),
-        })
-    });
-
-    if let Some(ref prov) = providers {
-        let _ = db::cache_providers(&client, &table, tmdb_id, prov).await;
+    // 2. Ensure seasons are cached. `/tv/{id}` details don't include them, so a
+    //    first visit would otherwise render an empty season list.
+    let mut seasons = db::get_cached_seasons(&client, &table, tmdb_id).await.unwrap_or_default();
+    if seasons.is_empty() {
+        if let Ok(tmdb_seasons) = crate::tmdb::get_tv_seasons(tmdb_id).await {
+            seasons = tmdb_seasons.into_iter().map(|s| Season {
+                id: season_id(tmdb_id, s.season_number),
+                series_id: format!("ser_{}", tmdb_id),
+                tmdb_id: Some(s.id),
+                season_number: s.season_number,
+                name: s.name,
+                overview: s.overview,
+                poster_path: s.poster_path,
+                air_date: s.air_date,
+                episode_count: s.episode_count,
+            }).collect();
+            let _ = db::cache_seasons(&client, &table, tmdb_id, &seasons).await;
+        }
     }
 
-    let seasons = db::get_cached_seasons(&client, &table, tmdb_id).await.unwrap_or_default();
     let body = build_series_response(&series, providers, &seasons);
     let mut resp = Response::builder()
         .status(200)
@@ -169,6 +186,11 @@ async fn handle_series_details(path: &str) -> Result<Response<Body>, Box<dyn std
         .unwrap();
     add_cors(&mut resp);
     Ok(resp)
+}
+
+/// Deterministic season id shared by every catalog response.
+fn season_id(tmdb_id: i64, season_number: i32) -> String {
+    format!("sea_{}_{}", tmdb_id, season_number)
 }
 
 async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
@@ -197,7 +219,7 @@ async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::
     };
 
     let seasons: Vec<Season> = tmdb_seasons.into_iter().map(|s| Season {
-        id: id::generate("sea"),
+        id: season_id(tmdb_id, s.season_number),
         series_id: format!("ser_{}", tmdb_id),
         tmdb_id: Some(s.id),
         season_number: s.season_number,
