@@ -41,40 +41,50 @@ async fn handle_search(req: Request) -> Result<Response<Body>, Box<dyn std::erro
         return Ok(error_response(AppError::Internal("Missing required parameter: q".into())));
     }
 
+    let user_id = shared::auth::extract_user_id(&req).ok();
     let table = std::env::var("DYNAMODB_TABLE_NAME").unwrap_or_else(|_| "episodic".to_string());
     let client = db::get_client().await;
 
-    if let Ok(Some((cached_items, cached_total_pages))) = db::get_cached_search(&client, &table, &q, page).await {
-        let body = json!({
-            "items": cached_items,
-            "pagination": { "page": page, "totalPages": cached_total_pages }
-        });
-        let mut resp = Response::builder()
-            .status(200)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        add_cors(&mut resp);
-        return Ok(resp);
-    }
+    let (items, total_pages) = if let Ok(Some((cached_items, cached_total_pages))) =
+        db::get_cached_search(&client, &table, &q, page).await
+    {
+        (cached_items, cached_total_pages)
+    } else {
+        let search_resp = match crate::tmdb::search_tv(&q, page).await {
+            Ok(r) => r,
+            Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB search failed: {}", e)))),
+        };
 
-    let search_resp = match crate::tmdb::search_tv(&q, page).await {
-        Ok(r) => r,
-        Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB search failed: {}", e)))),
+        let items: Vec<CatalogSeries> = search_resp.results.into_iter().map(|r| CatalogSeries {
+            id: r.id,
+            name: r.name,
+            poster_path: r.poster_path,
+            first_air_date: r.first_air_date,
+        }).collect();
+
+        let _ = db::cache_search_results(&client, &table, &q, page, &items, search_resp.total_pages).await;
+
+        (items, search_resp.total_pages)
     };
 
-    let items: Vec<CatalogSeries> = search_resp.results.into_iter().map(|r| CatalogSeries {
-        id: r.id,
-        name: r.name,
-        poster_path: r.poster_path,
-        first_air_date: r.first_air_date,
-    }).collect();
+    // Flag which results are already in the caller's library, so the client
+    // doesn't have to fetch the whole library to render the state.
+    let library: std::collections::HashSet<String> = match user_id.as_deref() {
+        Some(user_id) => db::list_library(&client, &table, user_id)
+            .await
+            .map(|items| items.into_iter().map(|item| item.series_id).collect())
+            .unwrap_or_default(),
+        None => std::collections::HashSet::new(),
+    };
 
-    let _ = db::cache_search_results(&client, &table, &q, page, &items, search_resp.total_pages).await;
+    let items_json: Vec<serde_json::Value> = items
+        .iter()
+        .map(|series| catalog_item_json(series, &library))
+        .collect();
 
     let body = json!({
-        "items": items,
-        "pagination": { "page": page, "totalPages": search_resp.total_pages }
+        "items": items_json,
+        "pagination": { "page": page, "totalPages": total_pages }
     });
 
     let mut resp = Response::builder()
@@ -84,6 +94,16 @@ async fn handle_search(req: Request) -> Result<Response<Body>, Box<dyn std::erro
         .unwrap();
     add_cors(&mut resp);
     Ok(resp)
+}
+
+/// Serialise a catalog search result, adding the caller's library membership.
+fn catalog_item_json(
+    series: &CatalogSeries,
+    library: &std::collections::HashSet<String>,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(series).unwrap_or_else(|_| json!({}));
+    value["inLibrary"] = json!(library.contains(&format!("ser_{}", series.id)));
+    value
 }
 
 async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
@@ -200,14 +220,24 @@ async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Re
 
     let mut watched_by_season: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
     let mut watched_episodes = 0;
-    if let Some(user_id) = user_id {
-        if let Ok(watched) = db::get_watched_set(&client, &table, &user_id, &series_id).await {
+    if let Some(ref user_id) = user_id {
+        if let Ok(watched) = db::get_watched_set(&client, &table, user_id, &series_id).await {
             watched_episodes = watched.len() as i32;
             for (season, _episode) in watched {
                 *watched_by_season.entry(season).or_insert(0) += 1;
             }
         }
     }
+
+    // Whether the caller already tracks this series in their library.
+    let in_library = match user_id.as_deref() {
+        Some(user_id) => db::get_library_item(&client, &table, user_id, &series_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some(),
+        None => false,
+    };
 
     let body = build_series_response(
         &series,
@@ -217,6 +247,7 @@ async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Re
         &season_totals,
         watched_episodes,
         total_episodes,
+        in_library,
     );
     let mut resp = Response::builder()
         .status(200)
@@ -367,6 +398,7 @@ fn build_series_response(
     season_totals: &std::collections::HashMap<i32, i32>,
     watched_episodes: i32,
     total_episodes: i32,
+    in_library: bool,
 ) -> serde_json::Value {
     let seasons_json: Vec<serde_json::Value> = seasons.iter().map(|s| {
         json!({
@@ -403,6 +435,7 @@ fn build_series_response(
         "status": series.status,
         "numberOfSeasons": series.number_of_seasons,
         "numberOfEpisodes": series.number_of_episodes,
+        "inLibrary": in_library,
         "seasons": seasons_json,
         "progress": {
             "watchedEpisodes": watched_episodes,
