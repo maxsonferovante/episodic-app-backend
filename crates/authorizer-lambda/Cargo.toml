@@ -1,5 +1,5 @@
 [package]
-name = "auth-lambda"
+name = "authorizer-lambda"
 version.workspace = true
 edition.workspace = true
 
@@ -9,12 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 shared.workspace = true
-lambda_http.workspace = true
+lambda_runtime.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-jsonwebtoken.workspace = true
-reqwest.workspace = true
-chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

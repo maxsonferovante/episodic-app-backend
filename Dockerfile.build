@@ -5,8 +5,10 @@ RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
 WORKDIR /app
 COPY . .
 
-RUN cargo build --release --target aarch64-unknown-linux-musl -p auth-lambda && \
-    cp target/aarch64-unknown-linux-musl/release/bootstrap /auth-bootstrap && \
+RUN cargo build --release --target aarch64-unknown-linux-musl -p google-auth-lambda && \
+    cp target/aarch64-unknown-linux-musl/release/bootstrap /google-auth-bootstrap && \
+    cargo build --release --target aarch64-unknown-linux-musl -p authorizer-lambda && \
+    cp target/aarch64-unknown-linux-musl/release/bootstrap /authorizer-bootstrap && \
     cargo build --release --target aarch64-unknown-linux-musl -p catalog-lambda && \
     cp target/aarch64-unknown-linux-musl/release/bootstrap /catalog-bootstrap && \
     cargo build --release --target aarch64-unknown-linux-musl -p library-lambda && \
@@ -20,9 +22,10 @@ RUN cargo build --release --target aarch64-unknown-linux-musl -p auth-lambda && 
 
 FROM alpine:3.19
 
-RUN mkdir -p /out/auth /out/catalog /out/library /out/progress /out/dashboard /out/sync-job
+RUN mkdir -p /out/google-auth /out/authorizer /out/catalog /out/library /out/progress /out/dashboard /out/sync-job
 
-COPY --from=builder /auth-bootstrap /out/auth/bootstrap
+COPY --from=builder /google-auth-bootstrap /out/google-auth/bootstrap
+COPY --from=builder /authorizer-bootstrap /out/authorizer/bootstrap
 COPY --from=builder /catalog-bootstrap /out/catalog/bootstrap
 COPY --from=builder /library-bootstrap /out/library/bootstrap
 COPY --from=builder /progress-bootstrap /out/progress/bootstrap

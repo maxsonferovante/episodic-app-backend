@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "crates/shared",
-    "crates/auth-lambda",
+    "crates/google-auth-lambda",
+    "crates/authorizer-lambda",
     "crates/catalog-lambda",
     "crates/library-lambda",
     "crates/progress-lambda",

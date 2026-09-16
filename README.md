@@ -10,7 +10,8 @@ Cargo workspace (`crates/`):
 | Crate | Responsibility |
 | --- | --- |
 | `shared` | Models, DynamoDB access, JWT auth, enums, helpers |
-| `auth-lambda` | Validates the Google `id_token` and issues JWT access/refresh tokens |
+| `google-auth-lambda` | Contact point with Google: validates the `id_token` and issues JWT access/refresh tokens |
+| `authorizer-lambda` | API Gateway `TOKEN` authorizer: validates the access token and returns an IAM policy |
 | `catalog-lambda` | TMDB search and series/seasons/episodes, cached in DynamoDB |
 | `library-lambda` | User library CRUD and per-series progress |
 | `progress-lambda` | Mark/unmark episodes (single or whole season) and watch events |
@@ -30,8 +31,8 @@ Every Lambda is a `bootstrap` binary built with `lambda_http`.
 | Variable | Used by | Description |
 | --- | --- | --- |
 | `DYNAMODB_TABLE_NAME` | all | DynamoDB table name |
-| `JWT_SECRET` | auth, library, progress, dashboard, catalog | HS256 secret for the API's own JWTs |
-| `GOOGLE_CLIENT_ID` | auth | Google OAuth client id |
+| `JWT_SECRET` | auth, authorizer, library, progress, dashboard, catalog | HS256 secret for the API's own JWTs |
+| `GOOGLE_CLIENT_ID` | google-auth | Google OAuth client id |
 | `TMDB_API_KEY` | catalog, sync-job | TMDB API key |
 | `TMDB_BASE_URL` | catalog | TMDB base URL |
 
@@ -59,14 +60,17 @@ cargo build --workspace
 Base URL: `https://<api-id>.execute-api.<region>.amazonaws.com/prod`
 (the infra repo exposes it as `api_endpoint`).
 
-Authenticated endpoints expect `Authorization: Bearer <accessToken>`.
+Authenticated endpoints expect `Authorization: Bearer <accessToken>`. Every
+route except `POST /api/v1/auth/google` and `POST /api/v1/auth/refresh` goes
+through the API Gateway JWT authorizer, so the backend always resolves the
+caller's user id.
 
 | Method | Path | Description |
 | --- | --- | --- |
 | POST | `/api/v1/auth/google` | Exchange a Google `id_token` for JWTs |
 | POST | `/api/v1/auth/refresh` | Refresh an access token |
-| GET | `/api/v1/series/search?q=&page=` | Search series |
-| GET | `/api/v1/series/{id}` | Series detail (accepts `1399` or `ser_1399`) |
+| GET | `/api/v1/series/search?q=&page=` | Search series (each item carries `inLibrary`) |
+| GET | `/api/v1/series/{id}` | Series detail (accepts `1399` or `ser_1399`, carries `inLibrary`) |
 | GET | `/api/v1/series/{id}/seasons` | Season list |
 | GET | `/api/v1/series/{id}/seasons/{n}` | Season detail with your watch status |
 | GET | `/api/v1/library` | Library with per-series progress |
@@ -77,7 +81,7 @@ Authenticated endpoints expect `Authorization: Bearer <accessToken>`.
 | PUT | `/api/v1/episodes/season/{seriesId}/{n}/progress` | Mark/unmark a whole season (aired episodes only) |
 | GET | `/api/v1/dashboard` | Continue watching, upcoming, recent history |
 | GET | `/api/v1/history?cursor=&limit=` | Paginated watch history |
-| GET | `/api/v1/calendar?month=YYYY-MM` | Calendar of episodes |
+| GET | `/api/v1/calendar?from=&to=` | Calendar of episodes (also accepts `month=YYYY-MM`) |
 
 ## Data model (DynamoDB)
 
