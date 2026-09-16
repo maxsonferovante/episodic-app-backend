@@ -20,7 +20,7 @@ INFRA_DIR="$ROOT_DIR/../episodic-app-infra-cloud"
 # Lambdas live in sa-east-1; override with AWS_REGION if ever needed.
 REGION="${AWS_REGION:-sa-east-1}"
 
-ALL_CRATES=(google-auth-lambda authorizer-lambda catalog-lambda library-lambda progress-lambda dashboard-lambda sync-job)
+ALL_CRATES=(google-auth-lambda authorizer-lambda catalog-lambda library-lambda progress-lambda dashboard-lambda sync-job hydrate-worker)
 
 function_name() {
     echo "episodic-${1%-lambda}"

@@ -183,6 +183,12 @@ async fn handle_add_to_library(req: Request) -> Result<Response<Body>, AppError>
     add_to_library(&client, &table, &item).await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    // Kick off full metadata hydration in the background (SQS). Best-effort:
+    // a queue hiccup must never fail the add.
+    if let Err(e) = shared::sqs::enqueue_hydrate(&item.series_id).await {
+        tracing::warn!("Failed to enqueue hydrate for {}: {}", item.series_id, e);
+    }
+
     let body = json!({
         "id": item.id,
         "seriesId": item.series_id,

@@ -10,6 +10,34 @@ const CACHE_TTL_MONTH: i64 = 30 * 24 * 3600;
 const CACHE_TTL_PROVIDERS: i64 = 7 * 24 * 3600;
 const CACHE_TTL_SEARCH: i64 = 3600;
 
+/// Lazy catalog reads (series / seasons) are cached for a month while airing.
+pub const CACHE_TTL_LAZY_ONGOING: i64 = CACHE_TTL_MONTH;
+
+/// Finished series never change, so their metadata is frozen effectively forever.
+pub const CACHE_TTL_FINISHED: i64 = 3650 * 24 * 3600;
+/// On-air series are refreshed weekly by the hydrate worker.
+pub const CACHE_TTL_HYDRATED_ONGOING: i64 = 7 * 24 * 3600;
+
+/// Cache TTL for a series based on its TMDB status: `ongoing` while it is still
+/// airing, the far-future finished TTL once it has ended.
+pub fn ttl_for_series(status: &str, ongoing: i64) -> i64 {
+    if crate::enums::series_status::is_finished(status) {
+        CACHE_TTL_FINISHED
+    } else {
+        ongoing
+    }
+}
+
+/// Deterministic canonical id for a series, shared across every response.
+pub fn series_id(tmdb_id: i64) -> String {
+    format!("ser_{}", tmdb_id)
+}
+
+/// Deterministic canonical id for a season.
+pub fn season_id(tmdb_id: i64, season_number: i32) -> String {
+    format!("sea_{}_{}", tmdb_id, season_number)
+}
+
 pub async fn get_client() -> Client {
     if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
         let config = aws_config::from_env()
@@ -217,8 +245,7 @@ pub struct SeriesMeta {
     pub status: Option<String>,
 }
 
-/// Series metadata, preferring the synced meta and falling back to the catalog
-/// cache keyed by TMDB id.
+/// Series display metadata, read from the canonical `SER#<series_id>` row.
 pub async fn get_series_meta(
     client: &Client,
     table: &str,
@@ -241,24 +268,6 @@ pub async fn get_series_meta(
         if !name.is_empty() {
             return Ok(Some(SeriesMeta {
                 name,
-                poster_path: get_opt_str(item, "posterPath").map(str::to_string),
-                first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
-                status: get_opt_str(item, "status").map(str::to_string),
-            }));
-        }
-    }
-
-    if let Some(tmdb_id) = series_id.strip_prefix("ser_").and_then(|s| s.parse::<i64>().ok()) {
-        let cached = client
-            .get_item()
-            .table_name(table)
-            .key("PK", AttributeValue::S(format!("SERIES#{}", tmdb_id)))
-            .key("SK", AttributeValue::S("META".to_string()))
-            .send()
-            .await?;
-        if let Some(item) = cached.item() {
-            return Ok(Some(SeriesMeta {
-                name: get_str(item, "name").to_string(),
                 poster_path: get_opt_str(item, "posterPath").map(str::to_string),
                 first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
                 status: get_opt_str(item, "status").map(str::to_string),
@@ -538,26 +547,7 @@ pub async fn get_series_total_episodes(
         .map(|item| get_i32(item, "numberOfEpisodes"))
         .unwrap_or(0);
 
-    if count > 0 {
-        return Ok(count);
-    }
-
-    // Fall back to the catalog cache when the series hasn't been synced yet.
-    if let Some(tmdb_id) = series_id.strip_prefix("ser_").and_then(|s| s.parse::<i64>().ok()) {
-        let cached = client
-            .get_item()
-            .table_name(table)
-            .key("PK", AttributeValue::S(format!("SERIES#{}", tmdb_id)))
-            .key("SK", AttributeValue::S("META".to_string()))
-            .send()
-            .await?;
-        return Ok(cached
-            .item()
-            .map(|item| get_i32(item, "numberOfEpisodes"))
-            .unwrap_or(0));
-    }
-
-    Ok(0)
+    Ok(count)
 }
 
 /// Aired episodes (airDate <= today) for a series: total and per season.
@@ -657,7 +647,7 @@ pub async fn get_cached_series(client: &Client, table: &str, tmdb_id: i64) -> Re
     let result = client
         .get_item()
         .table_name(table)
-        .key("PK", AttributeValue::S(format!("SERIES#{}", tmdb_id)))
+        .key("PK", AttributeValue::S(format!("SER#{}", series_id(tmdb_id))))
         .key("SK", AttributeValue::S("META".to_string()))
         .send()
         .await?;
@@ -690,10 +680,14 @@ pub async fn get_cached_series(client: &Client, table: &str, tmdb_id: i64) -> Re
     }))
 }
 
-pub async fn cache_series(client: &Client, table: &str, series: &crate::models::series::Series) -> Result<(), aws_sdk_dynamodb::Error> {
-    let expires_at = chrono::Utc::now().timestamp() + CACHE_TTL_MONTH;
+pub async fn cache_series(
+    client: &Client,
+    table: &str,
+    series: &crate::models::series::Series,
+    expires_at: i64,
+) -> Result<(), aws_sdk_dynamodb::Error> {
     let mut item = std::collections::HashMap::new();
-    item.insert("PK".to_string(), AttributeValue::S(format!("SERIES#{}", series.tmdb_id)));
+    item.insert("PK".to_string(), AttributeValue::S(format!("SER#{}", series_id(series.tmdb_id))));
     item.insert("SK".to_string(), AttributeValue::S("META".to_string()));
     item.insert("id".to_string(), AttributeValue::S(series.id.clone()));
     item.insert("name".to_string(), AttributeValue::S(series.name.clone()));
@@ -722,6 +716,146 @@ pub async fn cache_series(client: &Client, table: &str, series: &crate::models::
     Ok(())
 }
 
+/// Hydration state tracked on the canonical series meta row.
+pub struct HydrationState {
+    pub hydration_status: Option<String>,
+    pub series_status: Option<String>,
+    pub next_air_date: Option<String>,
+    pub expires_at: i64,
+}
+
+/// Read the hydrate bookkeeping for a series, if its meta row exists.
+pub async fn get_hydration_state(
+    client: &Client,
+    table: &str,
+    tmdb_id: i64,
+) -> Result<Option<HydrationState>, aws_sdk_dynamodb::Error> {
+    let result = client
+        .get_item()
+        .table_name(table)
+        .key("PK", AttributeValue::S(format!("SER#{}", series_id(tmdb_id))))
+        .key("SK", AttributeValue::S("META".to_string()))
+        .send()
+        .await?;
+
+    let item = match result.item() {
+        Some(item) => item,
+        None => return Ok(None),
+    };
+
+    Ok(Some(HydrationState {
+        hydration_status: get_opt_str(item, "hydrationStatus").map(str::to_string),
+        series_status: get_opt_str(item, "status").map(str::to_string),
+        next_air_date: get_opt_str(item, "nextAirDate").map(str::to_string),
+        expires_at: item
+            .get("expiresAt")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0),
+    }))
+}
+
+/// Acquire the in-flight hydration lock. Returns `false` when another worker
+/// holds it (or held it more recently than `stale_before`), so concurrent
+/// deliveries of the same series don't stampede TMDB.
+pub async fn try_acquire_hydration_lock(
+    client: &Client,
+    table: &str,
+    tmdb_id: i64,
+    stale_before: &str,
+) -> Result<bool, aws_sdk_dynamodb::Error> {
+    let result = client
+        .update_item()
+        .table_name(table)
+        .key("PK", AttributeValue::S(format!("SER#{}", series_id(tmdb_id))))
+        .key("SK", AttributeValue::S("META".to_string()))
+        .update_expression("SET hydrationStatus = :h, hydratedAt = :now")
+        .condition_expression(
+            "attribute_not_exists(hydrationStatus) OR hydrationStatus <> :h \
+             OR attribute_not_exists(hydratedAt) OR hydratedAt < :stale",
+        )
+        .expression_attribute_values(
+            ":h",
+            AttributeValue::S(crate::enums::hydration_status::HYDRATING.to_string()),
+        )
+        .expression_attribute_values(":now", AttributeValue::S(chrono::Utc::now().to_rfc3339()))
+        .expression_attribute_values(":stale", AttributeValue::S(stale_before.to_string()))
+        .send()
+        .await;
+
+    match result {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            let is_conditional = e
+                .as_service_error()
+                .map(|service_error| service_error.is_conditional_check_failed_exception())
+                .unwrap_or(false);
+            if is_conditional {
+                Ok(false)
+            } else {
+                Err(e.into())
+            }
+        }
+    }
+}
+
+/// Release or reset the hydration lock (used when a hydrate run fails).
+pub async fn set_hydration_status(
+    client: &Client,
+    table: &str,
+    tmdb_id: i64,
+    status: &str,
+) -> Result<(), aws_sdk_dynamodb::Error> {
+    client
+        .update_item()
+        .table_name(table)
+        .key("PK", AttributeValue::S(format!("SER#{}", series_id(tmdb_id))))
+        .key("SK", AttributeValue::S("META".to_string()))
+        .update_expression("SET hydrationStatus = :h, hydratedAt = :now")
+        .expression_attribute_values(":h", AttributeValue::S(status.to_string()))
+        .expression_attribute_values(":now", AttributeValue::S(chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Stamp a hydrated series as complete, recording when it was fetched, when the
+/// next episode airs (so the scheduler knows when to refresh), and its TTL.
+pub async fn mark_hydration_complete(
+    client: &Client,
+    table: &str,
+    tmdb_id: i64,
+    hydrated_at: &str,
+    next_air_date: Option<&str>,
+    expires_at: i64,
+) -> Result<(), aws_sdk_dynamodb::Error> {
+    let mut builder = client
+        .update_item()
+        .table_name(table)
+        .key("PK", AttributeValue::S(format!("SER#{}", series_id(tmdb_id))))
+        .key("SK", AttributeValue::S("META".to_string()))
+        .update_expression(
+            "SET hydrationStatus = :h, hydratedAt = :now, expiresAt = :exp",
+        )
+        .expression_attribute_values(
+            ":h",
+            AttributeValue::S(crate::enums::hydration_status::COMPLETE.to_string()),
+        )
+        .expression_attribute_values(":now", AttributeValue::S(hydrated_at.to_string()))
+        .expression_attribute_values(":exp", AttributeValue::N(expires_at.to_string()));
+
+    if let Some(air_date) = next_air_date {
+        builder = builder
+            .update_expression(
+                "SET hydrationStatus = :h, hydratedAt = :now, expiresAt = :exp, nextAirDate = :next",
+            )
+            .expression_attribute_values(":next", AttributeValue::S(air_date.to_string()));
+    }
+
+    builder.send().await?;
+    Ok(())
+}
+
 pub async fn cache_providers(
     client: &Client,
     table: &str,
@@ -730,7 +864,7 @@ pub async fn cache_providers(
 ) -> Result<(), aws_sdk_dynamodb::Error> {
     let expires_at = chrono::Utc::now().timestamp() + CACHE_TTL_PROVIDERS;
     let mut item = HashMap::new();
-    item.insert("PK".to_string(), AttributeValue::S(format!("SERIES#{}", tmdb_id)));
+    item.insert("PK".to_string(), AttributeValue::S(format!("SER#{}", series_id(tmdb_id))));
     item.insert("SK".to_string(), AttributeValue::S("PROVIDERS".to_string()));
     item.insert("expiresAt".to_string(), AttributeValue::N(expires_at.to_string()));
     item.insert("updatedAt".to_string(), AttributeValue::S(chrono::Utc::now().to_rfc3339()));
@@ -770,7 +904,7 @@ pub async fn get_cached_providers(
     let result = client
         .get_item()
         .table_name(table)
-        .key("PK", AttributeValue::S(format!("SERIES#{}", tmdb_id)))
+        .key("PK", AttributeValue::S(format!("SER#{}", series_id(tmdb_id))))
         .key("SK", AttributeValue::S("PROVIDERS".to_string()))
         .send()
         .await?;
@@ -908,8 +1042,8 @@ pub async fn get_cached_seasons(client: &Client, table: &str, tmdb_id: i64) -> R
         .query()
         .table_name(table)
         .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(format!("SERIES#{}", tmdb_id)))
-        .expression_attribute_values(":sk_prefix", AttributeValue::S("SEASON#".to_string()))
+        .expression_attribute_values(":pk", AttributeValue::S(format!("SER#{}", series_id(tmdb_id))))
+        .expression_attribute_values(":sk_prefix", AttributeValue::S("SN#".to_string()))
         .send()
         .await?;
 
@@ -936,13 +1070,12 @@ pub async fn cache_seasons(
     table: &str,
     tmdb_id: i64,
     seasons: &[crate::models::season::Season],
+    expires_at: i64,
 ) -> Result<(), aws_sdk_dynamodb::Error> {
-    let expires_at = chrono::Utc::now().timestamp() + CACHE_TTL_MONTH;
-
     for season in seasons {
         let mut item = HashMap::new();
-        item.insert("PK".to_string(), AttributeValue::S(format!("SERIES#{}", tmdb_id)));
-        item.insert("SK".to_string(), AttributeValue::S(format!("SEASON#{:02}", season.season_number)));
+        item.insert("PK".to_string(), AttributeValue::S(format!("SER#{}", series_id(tmdb_id))));
+        item.insert("SK".to_string(), AttributeValue::S(format!("SN#{:02}", season.season_number)));
         item.insert("id".to_string(), AttributeValue::S(season.id.clone()));
         item.insert("seriesId".to_string(), AttributeValue::S(season.series_id.clone()));
         if let Some(tid) = season.tmdb_id {

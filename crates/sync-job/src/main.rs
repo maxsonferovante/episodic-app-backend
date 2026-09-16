@@ -1,5 +1,4 @@
-use lambda_runtime::{run, service_fn, LambdaEvent};
-use shared::error::AppError;
+use lambda_runtime::{run, service_fn};
 use serde::Deserialize;
 
 mod handler;

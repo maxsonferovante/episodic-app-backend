@@ -1,3 +1,6 @@
+//! TMDB API client and response shapes, shared by the catalog lambda and the
+//! hydrate worker so both read the same fields from the same endpoints.
+
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -26,7 +29,7 @@ pub struct TmdbSearchResponse {
 pub struct TmdbTvDetails {
     pub id: i64,
     pub name: String,
-    #[serde(rename = "original_name")]
+    #[serde(rename = "original_name", default)]
     pub original_name: String,
     #[serde(rename = "first_air_date")]
     pub first_air_date: Option<String>,
@@ -42,10 +45,35 @@ pub struct TmdbTvDetails {
     pub number_of_seasons: Option<i32>,
     #[serde(rename = "number_of_episodes")]
     pub number_of_episodes: Option<i32>,
+    /// Present only when `external_ids` is appended to the request.
     #[serde(rename = "imdb_id")]
     pub imdb_id: Option<String>,
     #[serde(rename = "watch_providers")]
     pub watch_providers: Option<TmdbWatchProviders>,
+    /// `/tv/{id}` already returns the full season list — no extra call needed.
+    #[serde(default)]
+    pub seasons: Vec<TmdbSeason>,
+    #[serde(rename = "next_episode_to_air")]
+    pub next_episode_to_air: Option<TmdbNextEpisode>,
+    #[serde(rename = "external_ids")]
+    pub external_ids: Option<TmdbExternalIds>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TmdbNextEpisode {
+    #[serde(rename = "air_date")]
+    pub air_date: Option<String>,
+    #[serde(rename = "season_number")]
+    pub season_number: Option<i32>,
+    #[serde(rename = "episode_number")]
+    pub episode_number: Option<i32>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TmdbExternalIds {
+    #[serde(rename = "imdb_id")]
+    pub imdb_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +102,7 @@ pub struct TmdbProvider {
 #[derive(Debug, Deserialize)]
 pub struct TmdbSeason {
     pub id: i64,
+    #[serde(default)]
     pub name: String,
     pub overview: Option<String>,
     #[serde(rename = "poster_path")]
@@ -82,13 +111,14 @@ pub struct TmdbSeason {
     pub season_number: i32,
     #[serde(rename = "air_date")]
     pub air_date: Option<String>,
-    #[serde(rename = "episode_count")]
+    #[serde(default, rename = "episode_count")]
     pub episode_count: i32,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct TmdbSeasonDetail {
     pub id: i64,
+    #[serde(default)]
     pub name: String,
     pub overview: Option<String>,
     #[serde(rename = "poster_path")]
@@ -97,12 +127,14 @@ pub struct TmdbSeasonDetail {
     pub season_number: i32,
     #[serde(rename = "air_date")]
     pub air_date: Option<String>,
+    #[serde(default)]
     pub episodes: Vec<TmdbEpisode>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct TmdbEpisode {
     pub id: i64,
+    #[serde(default)]
     pub name: String,
     pub overview: Option<String>,
     #[serde(rename = "still_path")]
@@ -126,68 +158,44 @@ fn base_url() -> String {
 
 pub async fn search_tv(query: &str, page: i32) -> Result<TmdbSearchResponse, reqwest::Error> {
     let client = Client::new();
-    let resp: TmdbSearchResponse = client
+    client
         .get(format!("{}/search/tv", base_url()))
         .query(&[("api_key", api_key().as_str()), ("query", query), ("page", &page.to_string())])
         .send()
         .await?
         .json()
-        .await?;
-    Ok(resp)
+        .await
 }
 
+/// Series details with providers and external ids appended. Also carries the
+/// season list, so callers never need a second `/tv/{id}` request.
 pub async fn get_tv_details(tmdb_id: i64) -> Result<TmdbTvDetails, reqwest::Error> {
     let client = Client::new();
-    let resp: TmdbTvDetails = client
+    client
         .get(format!("{}/tv/{}", base_url(), tmdb_id))
-        .query(&[("api_key", api_key().as_str()), ("append_to_response", "watch_providers")])
+        .query(&[("api_key", api_key().as_str()), ("append_to_response", "watch_providers,external_ids")])
         .send()
         .await?
         .json()
-        .await?;
-    Ok(resp)
+        .await
 }
 
-pub async fn get_tv_seasons(tmdb_id: i64) -> Result<Vec<TmdbSeason>, reqwest::Error> {
+pub async fn get_tv_season_detail(
+    tmdb_id: i64,
+    season_number: i32,
+) -> Result<TmdbSeasonDetail, reqwest::Error> {
     let client = Client::new();
-    let resp: serde_json::Value = client
-        .get(format!("{}/tv/{}", base_url(), tmdb_id))
-        .query(&[("api_key", api_key().as_str())])
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    let seasons = resp["seasons"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| {
-                    Some(TmdbSeason {
-                        id: s["id"].as_i64()?,
-                        name: s["name"].as_str()?.to_string(),
-                        overview: s["overview"].as_str().map(|s| s.to_string()),
-                        poster_path: s["poster_path"].as_str().map(|s| s.to_string()),
-                        season_number: s["season_number"].as_i64()? as i32,
-                        air_date: s["air_date"].as_str().map(|s| s.to_string()),
-                        episode_count: s["episode_count"].as_i64()? as i32,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(seasons)
-}
-
-pub async fn get_tv_season_detail(tmdb_id: i64, season_number: i32) -> Result<TmdbSeasonDetail, reqwest::Error> {
-    let client = Client::new();
-    let resp: TmdbSeasonDetail = client
+    client
         .get(format!("{}/tv/{}/season/{}", base_url(), tmdb_id, season_number))
         .query(&[("api_key", api_key().as_str())])
         .send()
         .await?
         .json()
-        .await?;
-    Ok(resp)
+        .await
+}
+
+/// Season list for a series. `/tv/{id}` already embeds it, so this is a thin
+/// wrapper over the details endpoint.
+pub async fn get_tv_seasons(tmdb_id: i64) -> Result<Vec<TmdbSeason>, reqwest::Error> {
+    Ok(get_tv_details(tmdb_id).await?.seasons)
 }

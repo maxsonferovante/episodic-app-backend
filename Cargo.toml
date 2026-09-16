@@ -8,6 +8,7 @@ members = [
     "crates/progress-lambda",
     "crates/dashboard-lambda",
     "crates/sync-job",
+    "crates/hydrate-worker",
 ]
 resolver = "2"
 
@@ -27,6 +28,7 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 aws-config = { version = "1", features = ["rustls"] }
 aws-sdk-dynamodb = { version = "1", features = ["rustls"] }
+aws-sdk-sqs = { version = "1", features = ["rustls"] }
 jsonwebtoken = "9"
 thiserror = "2"
 tracing = "0.1"

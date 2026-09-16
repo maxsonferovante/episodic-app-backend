@@ -1,7 +1,6 @@
 use lambda_http::{Body, Request, Response};
 use shared::db;
 use shared::error::{AppError, app_error_response as error_response, add_cors};
-use shared::id;
 use shared::models::series::{CatalogSeries, Series, WatchProviders, Provider};
 use shared::models::season::Season;
 use shared::models::episode::Episode;
@@ -50,7 +49,7 @@ async fn handle_search(req: Request) -> Result<Response<Body>, Box<dyn std::erro
     {
         (cached_items, cached_total_pages)
     } else {
-        let search_resp = match crate::tmdb::search_tv(&q, page).await {
+        let search_resp = match shared::tmdb::search_tv(&q, page).await {
             Ok(r) => r,
             Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB search failed: {}", e)))),
         };
@@ -120,14 +119,14 @@ async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Re
             (cached, providers)
         }
         _ => {
-            let details = match crate::tmdb::get_tv_details(tmdb_id).await {
+            let details = match shared::tmdb::get_tv_details(tmdb_id).await {
                 Ok(d) => d,
                 Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB details failed: {}", e)))),
             };
 
             let now = chrono::Utc::now().to_rfc3339();
             let series = Series {
-                id: id::generate("ser"),
+                id: db::series_id(tmdb_id),
                 tmdb_id: details.id,
                 imdb_id: details.imdb_id,
                 name: details.name,
@@ -144,10 +143,12 @@ async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Re
                 updated_at: now,
             };
 
-            let _ = db::cache_series(&client, &table, &series).await;
+            let expires_at = chrono::Utc::now().timestamp()
+                + db::ttl_for_series(&series.status, db::CACHE_TTL_LAZY_ONGOING);
+            let _ = db::cache_series(&client, &table, &series, expires_at).await;
 
             let providers = details.watch_providers.and_then(|wp| wp.results).and_then(|r| {
-                let country = detect_country();
+                let country = shared::config::provider_country();
                 r.get(&country).map(|cp| WatchProviders {
                     flatrate: cp.flatrate.as_ref().map(|v| v.iter().map(|p| Provider {
                         provider_id: p.provider_id,
@@ -184,10 +185,12 @@ async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Re
     //    first visit would otherwise render an empty season list.
     let mut seasons = db::get_cached_seasons(&client, &table, tmdb_id).await.unwrap_or_default();
     if seasons.is_empty() {
-        if let Ok(tmdb_seasons) = crate::tmdb::get_tv_seasons(tmdb_id).await {
+        if let Ok(tmdb_seasons) = shared::tmdb::get_tv_seasons(tmdb_id).await {
+            let expires_at = chrono::Utc::now().timestamp()
+                + db::ttl_for_series(&series.status, db::CACHE_TTL_LAZY_ONGOING);
             seasons = tmdb_seasons.into_iter().map(|s| Season {
-                id: season_id(tmdb_id, s.season_number),
-                series_id: format!("ser_{}", tmdb_id),
+                id: db::season_id(tmdb_id, s.season_number),
+                series_id: db::series_id(tmdb_id),
                 tmdb_id: Some(s.id),
                 season_number: s.season_number,
                 name: s.name,
@@ -196,13 +199,13 @@ async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Re
                 air_date: s.air_date,
                 episode_count: s.episode_count,
             }).collect();
-            let _ = db::cache_seasons(&client, &table, tmdb_id, &seasons).await;
+            let _ = db::cache_seasons(&client, &table, tmdb_id, &seasons, expires_at).await;
         }
     }
 
     // 3. Watch progress over *aired* episodes only, so upcoming episodes don't
     //    count against progress and the UI never fans out over every season.
-    let series_id = format!("ser_{}", tmdb_id);
+    let series_id = db::series_id(tmdb_id);
     let (aired_total, aired_by_season) = db::get_aired_counts(&client, &table, &series_id)
         .await
         .unwrap_or((0, std::collections::HashMap::new()));
@@ -258,11 +261,6 @@ async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Re
     Ok(resp)
 }
 
-/// Deterministic season id shared by every catalog response.
-fn season_id(tmdb_id: i64, season_number: i32) -> String {
-    format!("sea_{}_{}", tmdb_id, season_number)
-}
-
 async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
     let tmdb_id = extract_series_id(path, "/api/v1/series/")
         .ok_or_else(|| AppError::Internal("Invalid series ID".into()))?;
@@ -283,14 +281,14 @@ async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::
         }
     }
 
-    let tmdb_seasons = match crate::tmdb::get_tv_seasons(tmdb_id).await {
+    let tmdb_seasons = match shared::tmdb::get_tv_seasons(tmdb_id).await {
         Ok(s) => s,
         Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB seasons failed: {}", e)))),
     };
 
     let seasons: Vec<Season> = tmdb_seasons.into_iter().map(|s| Season {
-        id: season_id(tmdb_id, s.season_number),
-        series_id: format!("ser_{}", tmdb_id),
+        id: db::season_id(tmdb_id, s.season_number),
+        series_id: db::series_id(tmdb_id),
         tmdb_id: Some(s.id),
         season_number: s.season_number,
         name: s.name,
@@ -300,7 +298,8 @@ async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::
         episode_count: s.episode_count,
     }).collect();
 
-    let _ = db::cache_seasons(&client, &table, tmdb_id, &seasons).await;
+    let expires_at = chrono::Utc::now().timestamp() + db::CACHE_TTL_LAZY_ONGOING;
+    let _ = db::cache_seasons(&client, &table, tmdb_id, &seasons, expires_at).await;
 
     let body = json!({ "items": seasons });
     let mut resp = Response::builder()
@@ -327,14 +326,14 @@ async fn handle_season_detail(
     let table = std::env::var("DYNAMODB_TABLE_NAME").unwrap_or_else(|_| "episodic".to_string());
     let client = db::get_client().await;
 
-    let series_id = format!("ser_{}", tmdb_id);
-    let season_id = format!("sea_{}_{}", tmdb_id, season_number);
+    let series_id = db::series_id(tmdb_id);
+    let season_id = db::season_id(tmdb_id, season_number);
 
     // Resolve episodes from cache, falling back to TMDB.
     let mut episodes = match db::get_cached_episodes(&client, &table, tmdb_id, season_number).await {
         Ok(cached) if !cached.is_empty() => cached,
         _ => {
-            let detail = match crate::tmdb::get_tv_season_detail(tmdb_id, season_number).await {
+            let detail = match shared::tmdb::get_tv_season_detail(tmdb_id, season_number).await {
                 Ok(d) => d,
                 Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB season detail failed: {}", e)))),
             };
@@ -384,10 +383,6 @@ async fn handle_season_detail(
         .unwrap();
     add_cors(&mut resp);
     Ok(resp)
-}
-
-fn detect_country() -> String {
-    std::env::var("TMDB_COUNTRY").unwrap_or_else(|_| "US".to_string())
 }
 
 fn build_series_response(

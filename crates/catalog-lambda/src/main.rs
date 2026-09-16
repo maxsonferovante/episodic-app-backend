@@ -1,6 +1,5 @@
 use lambda_http::{run, service_fn};
 
-mod tmdb;
 mod handler;
 
 #[tokio::main]

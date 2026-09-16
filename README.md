@@ -16,9 +16,30 @@ Cargo workspace (`crates/`):
 | `library-lambda` | User library CRUD and per-series progress |
 | `progress-lambda` | Mark/unmark episodes (single or whole season) and watch events |
 | `dashboard-lambda` | Dashboard (continue watching, upcoming), history, calendar |
-| `sync-job` | Scheduled sync of library series metadata/episodes from TMDB |
+| `sync-job` | Daily **scheduler**: scans library series and enqueues a hydrate message for the ones needing a refresh (never fetches TMDB itself) |
+| `hydrate-worker` | SQS consumer: fully hydrates one series from TMDB (details, seasons, episodes, providers) and persists it canonically |
 
-Every Lambda is a `bootstrap` binary built with `lambda_http`.
+`google-auth`, `authorizer`, `catalog`, `library`, `progress`, `dashboard` are
+`bootstrap` binaries built with `lambda_http`. `sync-job` and `hydrate-worker`
+are `bootstrap` binaries built with `lambda_runtime` (EventBridge and SQS
+events, not HTTP).
+
+## Metadata hydration
+
+TMDB is queried once per series and reused by every user:
+
+- Adding a series to a library (`PUT /api/v1/library/{id}`) enqueues a message
+  on the `episodic-hydrate` SQS queue (best-effort).
+- `hydrate-worker` consumes it and runs `shared::hydrate::hydrate_series`, which
+  makes **1 + N** TMDB calls (details + one per aired season) and writes the
+  canonical `SER#ser_<tmdb>` rows: `META`, `SN#<ss>`, `EP#<ss>#<ee>` and
+  `PROVIDERS`.
+- **Finished** series (`Ended`/`Canceled`) are frozen with a far-future TTL and
+  never re-fetched. **On-air** series get a 7-day TTL; the daily `sync-job`
+  re-enqueues a series once its `nextAirDate` has passed or its cache expired.
+- The hydrate routine is idempotent and guarded by a conditional lock, so
+  duplicate SQS deliveries are no-ops and concurrent workers don't stampede TMDB.
+- Specials (season 0) are skipped entirely.
 
 ## Requirements
 
@@ -33,8 +54,10 @@ Every Lambda is a `bootstrap` binary built with `lambda_http`.
 | `DYNAMODB_TABLE_NAME` | all | DynamoDB table name |
 | `JWT_SECRET` | auth, authorizer, library, progress, dashboard, catalog | HS256 secret for the API's own JWTs |
 | `GOOGLE_CLIENT_ID` | google-auth | Google OAuth client id |
-| `TMDB_API_KEY` | catalog, sync-job | TMDB API key |
-| `TMDB_BASE_URL` | catalog | TMDB base URL |
+| `TMDB_API_KEY` | catalog, hydrate-worker | TMDB API key |
+| `TMDB_BASE_URL` | catalog, hydrate-worker | TMDB base URL (optional, defaults to `https://api.themoviedb.org/3`) |
+| `TMDB_COUNTRY` | catalog, hydrate-worker | Watch-provider region (defaults to `US`, defined in `shared::config`) |
+| `HYDRATE_QUEUE_URL` | library | SQS queue URL for hydrate jobs; unset = no-op (local dev) |
 
 ## Build & deploy
 
@@ -91,15 +114,26 @@ Single table with `PK` / `SK` and a `GSI1` (`GSI1PK` / `GSI1SK`). Highlights:
 - `USR#<id>` / `LIB#<seriesId>` — library item
 - `USR#<id>` / `PROG#<seriesId>#<ss>#<ee>` — watch progress
 - `USR#<id>` / `EVT#<ts>#<episodeId>` — watch events (history)
-- `SER#<seriesId>` / `META`, `SN#<ss>`, `EP#<ss>#<ee>` — synced catalog data
-  (`EP#` rows are indexed on `GSI1` by episode id)
-- `SERIES#<tmdbId>` / `META`, `SEASON#..`, `EPISODE#..` — catalog cache
+- `SER#ser_<tmdb>` / `META` — canonical series metadata plus hydrate
+  bookkeeping (`hydrationStatus`, `hydratedAt`, `nextAirDate`, `expiresAt`)
+- `SER#ser_<tmdb>` / `SN#<ss>` — season metadata
+- `SER#ser_<tmdb>` / `EP#<ss>#<ee>` — episodes (`GSI1PK = <episodeId>` so the
+  progress lambda can resolve an episode id back to series/season/episode)
+- `SER#ser_<tmdb>` / `PROVIDERS` — watch providers for `TMDB_COUNTRY`
+- `SEARCH#<query>#<page>` / `RESULTS` — short-lived search cache (1h)
+
+All series data is global and keyed by the deterministic id `ser_<tmdb>`; there
+is no per-user copy.
 
 ## Conventions
 
 - Episode ids are deterministic: `epi_<tmdbEpisodeId>`.
+- Series ids are deterministic: `ser_<tmdbId>`; season ids `sea_<tmdbId>_<ss>`.
 - Status strings live in `crates/shared/src/enums.rs` (no raw literals).
 - Series identifiers accept both the TMDB id and the internal `ser_<tmdb>` form.
+- TMDB is never queried on the read path once a series is hydrated; hydration
+  is idempotent and guarded by a conditional lock.
+- Watch-provider country is a single shared constant (`shared::config`).
 
 ## Related repos
 
