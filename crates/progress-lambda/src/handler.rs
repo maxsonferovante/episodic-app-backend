@@ -35,6 +35,25 @@ fn normalize_series_id(series_id: &str) -> String {
     }
 }
 
+/// Episode total used as the percentage denominator. Prefer the stored aired
+/// count (which now includes specials, matching the catalog and library views),
+/// falling back to the TMDB series total when no episodes are cached yet.
+async fn series_episode_total(
+    client: &db::Client,
+    table: &str,
+    series_id: &str,
+) -> Result<i32, AppError> {
+    let (aired, _) = db::get_aired_counts(client, table, series_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if aired > 0 {
+        return Ok(aired);
+    }
+    db::get_series_total_episodes(client, table, series_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))
+}
+
 pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
     let method = req.method().as_str();
     let path = req.uri().path();
@@ -102,9 +121,7 @@ async fn handle_get_progress(
     let watched_count = db::count_watched_in_series(client, table, user_id, &series_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    let total_episodes = db::get_series_total_episodes(client, table, &series_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let total_episodes = series_episode_total(client, table, &series_id).await?;
     let season_watched = db::count_watched_in_season(client, table, user_id, &series_id, season_number)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -296,9 +313,7 @@ async fn build_progress_response(
     let watched_count = db::count_watched_in_series(client, table, user_id, series_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    let total_episodes = db::get_series_total_episodes(client, table, series_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let total_episodes = series_episode_total(client, table, series_id).await?;
     let season_watched = db::count_watched_in_season(client, table, user_id, series_id, season_number)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;

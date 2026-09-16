@@ -1,7 +1,11 @@
 //! TMDB API client and response shapes, shared by the catalog lambda and the
 //! hydrate worker so both read the same fields from the same endpoints.
 
-use reqwest::Client;
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -156,42 +160,116 @@ fn base_url() -> String {
     std::env::var("TMDB_BASE_URL").unwrap_or_else(|_| "https://api.themoviedb.org/3".to_string())
 }
 
-pub async fn search_tv(query: &str, page: i32) -> Result<TmdbSearchResponse, reqwest::Error> {
+/// TMDB no longer publishes a hard quota but asks callers to stay around the
+/// ~40 req/s range and to honour `429` with `Retry-After`. We keep a margin
+/// below that ceiling.
+const MAX_REQUESTS_PER_SECOND: usize = 30;
+const WINDOW: Duration = Duration::from_secs(1);
+const MAX_429_RETRIES: u32 = 4;
+
+fn request_log() -> &'static Mutex<VecDeque<Instant>> {
+    static LOG: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// Sliding-window throttle: block until this process may issue another TMDB
+/// request without exceeding [`MAX_REQUESTS_PER_SECOND`] in any 1s window.
+async fn throttle() {
+    loop {
+        let wait = {
+            let mut log = request_log().lock().unwrap();
+            let now = Instant::now();
+            while log.front().is_some_and(|t| now.duration_since(*t) >= WINDOW) {
+                log.pop_front();
+            }
+            if log.len() < MAX_REQUESTS_PER_SECOND {
+                log.push_back(now);
+                None
+            } else {
+                let oldest = *log.front().unwrap();
+                Some(WINDOW.saturating_sub(now.duration_since(oldest)))
+            }
+        };
+
+        match wait {
+            None => return,
+            Some(d) if d.is_zero() => return,
+            Some(d) => tokio::time::sleep(d).await,
+        }
+    }
+}
+
+/// Rate-limited GET that retries on `429` after the server-provided
+/// `Retry-After` (defaulting to 1s), then decodes the JSON body.
+async fn get_json<T: for<'de> Deserialize<'de>>(
+    path: &str,
+    query: &[(&str, &str)],
+) -> Result<T, reqwest::Error> {
     let client = Client::new();
-    client
-        .get(format!("{}/search/tv", base_url()))
-        .query(&[("api_key", api_key().as_str()), ("query", query), ("page", &page.to_string())])
-        .send()
-        .await?
-        .json()
-        .await
+    let url = format!("{}{}", base_url(), path);
+
+    let mut retries = 0;
+    loop {
+        throttle().await;
+        let resp = client.get(&url).query(query).send().await?;
+
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS && retries < MAX_429_RETRIES {
+            retries += 1;
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1);
+            tracing::warn!(
+                "TMDB 429 on {}; retry {}/{} in {}s",
+                path,
+                retries,
+                MAX_429_RETRIES,
+                retry_after
+            );
+            tokio::time::sleep(Duration::from_secs(retry_after.max(1))).await;
+            continue;
+        }
+
+        return resp.error_for_status()?.json().await;
+    }
+}
+
+pub async fn search_tv(query: &str, page: i32) -> Result<TmdbSearchResponse, reqwest::Error> {
+    get_json(
+        "/search/tv",
+        &[
+            ("api_key", api_key().as_str()),
+            ("query", query),
+            ("page", &page.to_string()),
+        ],
+    )
+    .await
 }
 
 /// Series details with providers and external ids appended. Also carries the
 /// season list, so callers never need a second `/tv/{id}` request.
 pub async fn get_tv_details(tmdb_id: i64) -> Result<TmdbTvDetails, reqwest::Error> {
-    let client = Client::new();
-    client
-        .get(format!("{}/tv/{}", base_url(), tmdb_id))
-        .query(&[("api_key", api_key().as_str()), ("append_to_response", "watch_providers,external_ids")])
-        .send()
-        .await?
-        .json()
-        .await
+    get_json(
+        &format!("/tv/{}", tmdb_id),
+        &[
+            ("api_key", api_key().as_str()),
+            ("append_to_response", "watch_providers,external_ids"),
+        ],
+    )
+    .await
 }
 
 pub async fn get_tv_season_detail(
     tmdb_id: i64,
     season_number: i32,
 ) -> Result<TmdbSeasonDetail, reqwest::Error> {
-    let client = Client::new();
-    client
-        .get(format!("{}/tv/{}/season/{}", base_url(), tmdb_id, season_number))
-        .query(&[("api_key", api_key().as_str())])
-        .send()
-        .await?
-        .json()
-        .await
+    get_json(
+        &format!("/tv/{}/season/{}", tmdb_id, season_number),
+        &[("api_key", api_key().as_str())],
+    )
+    .await
 }
 
 /// Season list for a series. `/tv/{id}` already embeds it, so this is a thin

@@ -270,6 +270,8 @@ async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::
 
     if let Ok(cached) = db::get_cached_seasons(&client, &table, tmdb_id).await {
         if !cached.is_empty() {
+            let mut cached = cached;
+            cached.sort_by_key(|s| (s.season_number == 0, s.season_number));
             let body = json!({ "items": cached });
             let mut resp = Response::builder()
                 .status(200)
@@ -286,7 +288,7 @@ async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::
         Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB seasons failed: {}", e)))),
     };
 
-    let seasons: Vec<Season> = tmdb_seasons.into_iter().map(|s| Season {
+    let mut seasons: Vec<Season> = tmdb_seasons.into_iter().map(|s| Season {
         id: db::season_id(tmdb_id, s.season_number),
         series_id: db::series_id(tmdb_id),
         tmdb_id: Some(s.id),
@@ -297,6 +299,8 @@ async fn handle_seasons_list(path: &str) -> Result<Response<Body>, Box<dyn std::
         air_date: s.air_date,
         episode_count: s.episode_count,
     }).collect();
+    // Display order: numbered seasons ascending, specials (season 0) last.
+    seasons.sort_by_key(|s| (s.season_number == 0, s.season_number));
 
     let expires_at = chrono::Utc::now().timestamp() + db::CACHE_TTL_LAZY_ONGOING;
     let _ = db::cache_seasons(&client, &table, tmdb_id, &seasons, expires_at).await;
@@ -395,7 +399,10 @@ fn build_series_response(
     total_episodes: i32,
     in_library: bool,
 ) -> serde_json::Value {
-    let seasons_json: Vec<serde_json::Value> = seasons.iter().map(|s| {
+    let mut ordered_seasons: Vec<&Season> = seasons.iter().collect();
+    ordered_seasons.sort_by_key(|s| (s.season_number == 0, s.season_number));
+
+    let seasons_json: Vec<serde_json::Value> = ordered_seasons.iter().map(|s| {
         json!({
             "id": s.id,
             "seriesId": s.series_id,

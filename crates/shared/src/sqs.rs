@@ -7,6 +7,7 @@ use serde::Serialize;
 #[serde(rename_all = "camelCase")]
 struct HydrateMessage<'a> {
     series_id: &'a str,
+    force: bool,
 }
 
 async fn client() -> Client {
@@ -30,6 +31,22 @@ async fn client() -> Client {
 pub async fn enqueue_hydrate(
     series_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    send_hydrate(series_id, false).await
+}
+
+/// Enqueue a *forced* hydration, bypassing the "already fresh" short-circuit.
+/// Used by operator backfills (e.g. re-hydrating to pick up specials). Still a
+/// no-op when the queue URL is unset.
+pub async fn enqueue_hydrate_forced(
+    series_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    send_hydrate(series_id, true).await
+}
+
+async fn send_hydrate(
+    series_id: &str,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let queue_url = match std::env::var("HYDRATE_QUEUE_URL") {
         Ok(url) if !url.is_empty() => url,
         _ => {
@@ -41,7 +58,7 @@ pub async fn enqueue_hydrate(
         }
     };
 
-    let body = serde_json::to_string(&HydrateMessage { series_id })?;
+    let body = serde_json::to_string(&HydrateMessage { series_id, force })?;
     client()
         .await
         .send_message()

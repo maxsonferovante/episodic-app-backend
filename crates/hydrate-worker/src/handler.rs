@@ -26,6 +26,9 @@ struct HydrateMessage {
     series_id: Option<String>,
     #[serde(rename = "tmdbId")]
     tmdb_id: Option<i64>,
+    /// Operator backfills set this to bypass the fresh-hydration short-circuit.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,15 +81,16 @@ async fn process_record(
         _ => return Err("hydrate message missing seriesId/tmdbId".into()),
     };
 
-    let outcome = shared::hydrate::hydrate_series(client, table, tmdb_id).await?;
+    let outcome = shared::hydrate::hydrate_series(client, table, tmdb_id, message.force).await?;
     tracing::info!(
-        "Hydrated {} (status={}, finished={}, seasons={}, episodes={}, skipped={})",
+        "Hydrated {} (status={}, finished={}, seasons={}, episodes={}, skipped={}, forced={})",
         tmdb_id,
         outcome.status,
         outcome.finished,
         outcome.seasons_hydrated,
         outcome.episodes_written,
-        outcome.skipped
+        outcome.skipped,
+        message.force
     );
 
     Ok(())

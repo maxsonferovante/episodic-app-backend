@@ -29,24 +29,31 @@ pub struct HydrateOutcome {
 /// Fetch and persist every piece of metadata for a series that is useful to
 /// any user: series details, season list, episodes of aired seasons, and watch
 /// providers.
+///
+/// When `force` is set the "already hydrated and fresh" short-circuit is
+/// bypassed, so an operator-triggered backfill can refresh frozen (finished)
+/// series too.
 pub async fn hydrate_series(
     client: &Client,
     table: &str,
     tmdb_id: i64,
+    force: bool,
 ) -> Result<HydrateOutcome, Box<dyn std::error::Error + Send + Sync>> {
     // Idempotency: a duplicate delivery inside the TTL is a no-op.
-    if let Some(state) = db::get_hydration_state(client, table, tmdb_id).await? {
-        let fresh = state.expires_at > Utc::now().timestamp();
-        let complete = state.hydration_status.as_deref() == Some(enums::hydration_status::COMPLETE);
-        if complete && fresh {
-            return Ok(HydrateOutcome {
-                tmdb_id,
-                status: state.series_status.unwrap_or_default(),
-                finished: false,
-                seasons_hydrated: 0,
-                episodes_written: 0,
-                skipped: true,
-            });
+    if !force {
+        if let Some(state) = db::get_hydration_state(client, table, tmdb_id).await? {
+            let fresh = state.expires_at > Utc::now().timestamp();
+            let complete = state.hydration_status.as_deref() == Some(enums::hydration_status::COMPLETE);
+            if complete && fresh {
+                return Ok(HydrateOutcome {
+                    tmdb_id,
+                    status: state.series_status.unwrap_or_default(),
+                    finished: false,
+                    seasons_hydrated: 0,
+                    episodes_written: 0,
+                    skipped: true,
+                });
+            }
         }
     }
 
@@ -117,12 +124,11 @@ async fn hydrate_inner(
 
     let today = now.format("%Y-%m-%d").to_string();
 
-    // Season rows for every non-special season (specials are skipped entirely,
-    // matching the previous sync job).
+    // Season rows for every season, including specials (season 0). Specials are
+    // persisted so they count towards watch progress and render in the UI.
     let season_rows: Vec<Season> = details
         .seasons
         .iter()
-        .filter(|s| s.season_number > 0)
         .map(|s| Season {
             id: db::season_id(tmdb_id, s.season_number),
             series_id: canonical_id.clone(),
@@ -137,14 +143,18 @@ async fn hydrate_inner(
         .collect();
     db::cache_seasons(client, table, tmdb_id, &season_rows, expires_at).await?;
 
-    // Episodes only exist for seasons that have already aired.
+    // Episodes only exist for seasons that have already aired. Specials (season
+    // 0) carry no reliable season-level air date, so they are always fetched and
+    // filtered per-episode at read time.
     let mut seasons_hydrated = 0usize;
     let mut episodes_written = 0usize;
-    for season in details.seasons.iter().filter(|s| s.season_number > 0) {
-        let aired = match season.air_date.as_deref() {
-            Some(air_date) => air_date <= today.as_str(),
-            None => finished,
-        };
+    for season in details.seasons.iter() {
+        let is_special = season.season_number == 0;
+        let aired = is_special
+            || match season.air_date.as_deref() {
+                Some(air_date) => air_date <= today.as_str(),
+                None => finished,
+            };
         if !aired {
             continue;
         }

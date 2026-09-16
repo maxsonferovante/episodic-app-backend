@@ -602,7 +602,9 @@ pub async fn get_next_unwatched_episode(
         .filter_map(|item| {
             let season = get_i32(item, "seasonNumber");
             let episode = get_i32(item, "episodeNumber");
-            if season > 0 && episode > 0 {
+            // Specials (season 0) are eligible: they count towards progress and
+            // sort first, so they can be the next unwatched episode.
+            if episode > 0 {
                 let pk = get_str(item, "PK");
                 let sid = pk.strip_prefix("SER#").unwrap_or(pk).to_string();
                 Some((season, episode, sid))
