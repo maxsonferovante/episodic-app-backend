@@ -105,7 +105,14 @@ async fn handle_calendar(req: Request) -> Result<Response<Body>, AppError> {
         .collect();
 
     let month = params.get("month").map(|s| s.as_str()).unwrap_or("");
-    let (from, to) = if month.len() == 7 {
+    let from_param = params.get("from").map(|s| s.as_str()).unwrap_or("");
+    let to_param = params.get("to").map(|s| s.as_str()).unwrap_or("");
+
+    // Accept either an explicit range (`from`/`to`, what the web client sends)
+    // or the convenience `month=YYYY-MM`.
+    let (from, to) = if !from_param.is_empty() && !to_param.is_empty() {
+        (from_param.to_string(), to_param.to_string())
+    } else if month.len() == 7 {
         let year_month = month;
         let from = format!("{}-01", year_month);
         let next_month = {
@@ -120,7 +127,9 @@ async fn handle_calendar(req: Request) -> Result<Response<Body>, AppError> {
         };
         (from, next_month)
     } else {
-        return Err(AppError::Internal("month parameter required (YYYY-MM)".into()));
+        return Err(AppError::Internal(
+            "provide from/to (YYYY-MM-DD) or month (YYYY-MM)".into(),
+        ));
     };
 
     let calendar_days = get_calendar(&client, &table, &user_id, &from, &to).await
