@@ -1781,9 +1781,13 @@ pub async fn get_history_page(
     for item in actual_items {
         let watched_at = get_str(item, "occurredAt").to_string();
         let sk = get_str(item, "SK").to_string();
+        // Defensive: only EVT# rows belong on this feed. The cursor always
+        // advances past the raw item so a stray row can never loop or repeat.
+        last_sk = Some(sk.clone());
+        if !sk.starts_with("EVT#") {
+            continue;
+        }
         let meta = resolve_watch_event(client, table, item).await?;
-
-        last_sk = Some(sk);
 
         history.push(HistoryItem {
             episode: EpisodeRef {

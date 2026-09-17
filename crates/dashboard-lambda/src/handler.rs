@@ -9,6 +9,38 @@ fn get_table_name() -> Result<String, AppError> {
         .map_err(|_| AppError::Internal("DYNAMODB_TABLE_NAME not set".into()))
 }
 
+/// Percent-decode a query value (`%23` -> `#`, `+` -> space). API Gateway
+/// forwards query values still-encoded and `req.uri().query()` does not
+/// decode them — comparing an encoded cursor against stored keys silently
+/// matches the wrong range (`%` sorts above `#`, so an encoded `EVT%23…`
+/// cursor would return page 1 forever).
+fn url_decode(s: &str) -> String {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
     let method = req.method().as_str();
     let path = req.uri().path();
@@ -70,13 +102,13 @@ async fn handle_history(req: Request) -> Result<Response<Body>, AppError> {
         })
         .collect();
 
-    let cursor = params.get("cursor").map(|s| s.as_str());
+    let cursor = params.get("cursor").map(|s| url_decode(s));
     let limit = params.get("limit")
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(20)
         .min(100);
 
-    let response = get_history_page(&client, &table, &user_id, cursor, limit).await
+    let response = get_history_page(&client, &table, &user_id, cursor.as_deref(), limit).await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let body = serde_json::to_string(&response)
@@ -157,9 +189,9 @@ fn parse_window(query_str: &str) -> Result<(String, String), AppError> {
         })
         .collect();
 
-    let month = params.get("month").map(|s| s.as_str()).unwrap_or("");
-    let from_param = params.get("from").map(|s| s.as_str()).unwrap_or("");
-    let to_param = params.get("to").map(|s| s.as_str()).unwrap_or("");
+    let month = params.get("month").map(|s| url_decode(s)).unwrap_or_default();
+    let from_param = params.get("from").map(|s| url_decode(s)).unwrap_or_default();
+    let to_param = params.get("to").map(|s| url_decode(s)).unwrap_or_default();
 
     // Accept either an explicit range (`from`/`to`, what the web client sends)
     // or the convenience `month=YYYY-MM`.
