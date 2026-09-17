@@ -45,3 +45,6 @@ futures = "0.3"
 
 # Shared crate
 shared = { path = "crates/shared" }
+
+# Pure-Rust Fernet-compatible token crypto (no OpenSSL)
+cursor-crypto = { path = "crates/cursor-crypto" }
