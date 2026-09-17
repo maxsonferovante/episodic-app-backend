@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+cursor-crypto.workspace = true
 ulid.workspace = true
 serde.workspace = true
 serde_json.workspace = true

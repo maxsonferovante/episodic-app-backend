@@ -108,8 +108,25 @@ async fn handle_history(req: Request) -> Result<Response<Body>, AppError> {
         .unwrap_or(20)
         .min(100);
 
-    let response = get_history_page(&client, &table, &user_id, cursor.as_deref(), limit).await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    // Page tokens are opaque sealed cursors — open them back into raw keys.
+    // Anything else (tampered, raw, rotated key) is a 400, never page 1.
+    let cursor_key = cursor
+        .as_deref()
+        .map(shared::cursor::open_cursor)
+        .transpose()
+        .map_err(|_| AppError::InvalidCursor)?;
+
+    let mut response =
+        get_history_page(&client, &table, &user_id, cursor_key.as_deref(), limit)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // Seal the outgoing cursor so raw table keys never leak to clients.
+    response.next_cursor = response
+        .next_cursor
+        .map(|sk| shared::cursor::seal_cursor(&sk))
+        .transpose()
+        .map_err(|_| AppError::Internal("cursor key not configured".into()))?;
 
     let body = serde_json::to_string(&response)
         .map_err(|e| AppError::Internal(e.to_string()))?;

@@ -1,6 +1,7 @@
 pub mod id;
 pub mod error;
 pub mod auth;
+pub mod cursor;
 pub mod db;
 pub mod enums;
 pub mod models;

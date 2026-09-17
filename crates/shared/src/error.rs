@@ -27,6 +27,9 @@ pub enum AppError {
     #[error("TMDB unavailable")]
     TmdbUnavailable,
 
+    #[error("Invalid pagination cursor")]
+    InvalidCursor,
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -42,6 +45,7 @@ impl AppError {
             Self::AlreadyInLibrary => "ALREADY_IN_LIBRARY",
             Self::NotInLibrary => "NOT_IN_LIBRARY",
             Self::TmdbUnavailable => "TMDB_UNAVAILABLE",
+            Self::InvalidCursor => "INVALID_CURSOR",
             Self::Internal(_) => "INTERNAL_ERROR",
         }
     }
@@ -56,6 +60,7 @@ impl AppError {
             Self::AlreadyInLibrary => StatusCode::CONFLICT,
             Self::NotInLibrary => StatusCode::NOT_FOUND,
             Self::TmdbUnavailable => StatusCode::BAD_GATEWAY,
+            Self::InvalidCursor => StatusCode::BAD_REQUEST,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
