@@ -279,6 +279,17 @@ pub mod dashboard {
         pub series: SeriesRef,
         pub episode: EpisodeRef,
         pub air_date: String,
+        /// English weekday name ("Monday".."Sunday") derived from `air_date`.
+        #[serde(default)]
+        pub weekday: String,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ReleasesResponse {
+        pub from: String,
+        pub to: String,
+        pub items: Vec<UpcomingItem>,
     }
 
     #[derive(Debug, Serialize, Deserialize)]

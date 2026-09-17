@@ -1,6 +1,6 @@
 use lambda_http::{Body, Request, Response};
 use shared::auth::extract_user_id;
-use shared::db::{get_client, get_continue_watching, get_upcoming, get_recent_history, get_history_page, get_calendar};
+use shared::db::{get_client, get_continue_watching, get_upcoming, get_releases, get_recent_history, get_history_page, get_calendar};
 use shared::error::{AppError, app_error_response, add_cors};
 use serde_json::json;
 
@@ -17,6 +17,7 @@ pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std:
         "GET" if path.ends_with("/dashboard") => handle_dashboard(req).await,
         "GET" if path.ends_with("/history") => handle_history(req).await,
         "GET" if path.ends_with("/calendar") => handle_calendar(req).await,
+        "GET" if path.ends_with("/releases") => handle_releases(req).await,
         _ => Err(AppError::Internal("Not found".into())),
     };
 
@@ -96,6 +97,58 @@ async fn handle_calendar(req: Request) -> Result<Response<Body>, AppError> {
     let client = get_client().await;
 
     let query_str = req.uri().query().unwrap_or("");
+    let (from, to) = parse_window(query_str)?;
+
+    let calendar_days = get_calendar(&client, &table, &user_id, &from, &to).await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let response = shared::models::dashboard::CalendarResponse {
+        items: calendar_days,
+    };
+
+    let body = serde_json::to_string(&response)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let mut resp = Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    add_cors(&mut resp);
+    Ok(resp)
+}
+
+/// Release calendar: every episode from the user's library series airing in
+/// `[from, to)`. Same window params as `/calendar`.
+async fn handle_releases(req: Request) -> Result<Response<Body>, AppError> {
+    let user_id = extract_user_id(&req)?;
+    let table = get_table_name()?;
+    let client = get_client().await;
+
+    let query_str = req.uri().query().unwrap_or("");
+    let (from, to) = parse_window(query_str)?;
+
+    let items = get_releases(&client, &table, &user_id, &from, &to).await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let response = shared::models::dashboard::ReleasesResponse { from, to, items };
+
+    let body = serde_json::to_string(&response)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let mut resp = Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    add_cors(&mut resp);
+    Ok(resp)
+}
+
+/// Accept either an explicit range (`from`/`to`, what the web client sends)
+/// or the convenience `month=YYYY-MM`. Windows longer than a year are
+/// rejected so one call can't scan the whole catalog.
+fn parse_window(query_str: &str) -> Result<(String, String), AppError> {
     let params: std::collections::HashMap<String, String> = query_str
         .split('&')
         .filter_map(|pair| {
@@ -132,21 +185,10 @@ async fn handle_calendar(req: Request) -> Result<Response<Body>, AppError> {
         ));
     };
 
-    let calendar_days = get_calendar(&client, &table, &user_id, &from, &to).await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if from.len() != 10 || to.len() != 10 || from.as_str() > to.as_str() {
+        return Err(AppError::Internal("invalid window: use from<=to as YYYY-MM-DD".into()));
+    }
+    // Long windows are fine: `MAX_RELEASE_ITEMS` bounds the payload.
 
-    let response = shared::models::dashboard::CalendarResponse {
-        items: calendar_days,
-    };
-
-    let body = serde_json::to_string(&response)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let mut resp = Response::builder()
-        .status(200)
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap();
-    add_cors(&mut resp);
-    Ok(resp)
+    Ok((from, to))
 }

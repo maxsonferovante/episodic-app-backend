@@ -1438,6 +1438,14 @@ pub async fn get_continue_watching(client: &Client, table: &str, user_id: &str) 
     Ok(continue_watching)
 }
 
+/// English weekday name ("Monday".."Sunday") for a `YYYY-MM-DD` date.
+/// Falls back to "" when the date doesn't parse.
+pub fn weekday_name(date: &str) -> String {
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|d| d.format("%A").to_string())
+        .unwrap_or_default()
+}
+
 pub async fn get_upcoming(client: &Client, table: &str, user_id: &str) -> Result<Vec<UpcomingItem>, aws_sdk_dynamodb::Error> {
     let lib_result = client
         .query()
@@ -1501,6 +1509,7 @@ pub async fn get_upcoming(client: &Client, table: &str, user_id: &str) -> Result
         }
 
         if let Some((air_date, season_number, episode_number, episode_id, episode_name)) = next {
+            let weekday = weekday_name(&air_date);
             upcoming.push(UpcomingItem {
                 series: SeriesRef {
                     id: series_id,
@@ -1514,12 +1523,117 @@ pub async fn get_upcoming(client: &Client, table: &str, user_id: &str) -> Result
                     name: episode_name,
                 },
                 air_date,
+                weekday,
             });
         }
     }
 
     upcoming.sort_by(|a, b| a.air_date.cmp(&b.air_date));
     Ok(upcoming)
+}
+
+/// Cap for a single releases query so one call can't balloon the payload.
+pub const MAX_RELEASE_ITEMS: usize = 300;
+
+/// Every episode from the user's library series airing in `[from, to)`.
+/// Powers the releases views (week / month / 3 months / specific month).
+/// Only episodes already in cache are visible — series never hydrated or
+/// browsed contribute nothing. Episodes without an air date are skipped.
+pub async fn get_releases(
+    client: &Client,
+    table: &str,
+    user_id: &str,
+    from: &str,
+    to: &str,
+) -> Result<Vec<UpcomingItem>, aws_sdk_dynamodb::Error> {
+    let lib_result = client
+        .query()
+        .table_name(table)
+        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
+        .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)))
+        .expression_attribute_values(":sk_prefix", AttributeValue::S("LIB#".to_string()))
+        .send()
+        .await?;
+
+    // (air_date, series_id, series_name, poster, season, episode, id, name).
+    let mut items: Vec<(String, String, String, Option<String>, i32, i32, String, String)> =
+        Vec::new();
+
+    for lib_item in lib_result.items() {
+        let series_id = get_str(lib_item, "seriesId").to_string();
+        let mut series_name = get_str(lib_item, "seriesName").to_string();
+        let mut poster_path = get_opt_str(lib_item, "posterPath").map(|s| s.to_string());
+        if series_name.is_empty() || poster_path.is_none() {
+            let (name, poster) = get_series_ref(client, table, &series_id).await?;
+            if series_name.is_empty() {
+                series_name = name;
+            }
+            if poster_path.is_none() {
+                poster_path = poster;
+            }
+        }
+
+        let ep_result = client
+            .query()
+            .table_name(table)
+            .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
+            .expression_attribute_values(":pk", AttributeValue::S(format!("SER#{}", series_id)))
+            .expression_attribute_values(":sk_prefix", AttributeValue::S("EP#".to_string()))
+            .send()
+            .await?;
+
+        for ep_item in ep_result.items() {
+            let air_date = match get_opt_str(ep_item, "airDate") {
+                Some(d) => d.to_string(),
+                None => continue,
+            };
+            if air_date.as_str() < from || air_date.as_str() >= to {
+                continue;
+            }
+            items.push((
+                air_date,
+                series_id.clone(),
+                series_name.clone(),
+                poster_path.clone(),
+                get_i32(ep_item, "seasonNumber"),
+                get_i32(ep_item, "episodeNumber"),
+                get_str(ep_item, "id").to_string(),
+                get_str(ep_item, "name").to_string(),
+            ));
+        }
+    }
+
+    items.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.cmp(&b.1))
+            .then(a.4.cmp(&b.4))
+            .then(a.5.cmp(&b.5))
+    });
+    items.truncate(MAX_RELEASE_ITEMS);
+
+    Ok(items
+        .into_iter()
+        .map(
+            |(air_date, series_id, series_name, poster_path, season_number, episode_number, episode_id, episode_name)| {
+                let weekday = weekday_name(&air_date);
+                UpcomingItem {
+                    series: SeriesRef {
+                        id: series_id,
+                        name: series_name,
+                        poster_path,
+                    },
+                    episode: EpisodeRef {
+                        id: episode_id,
+                        season_number,
+                        episode_number,
+                        name: episode_name,
+                    },
+                    air_date,
+                    weekday,
+                }
+            },
+        )
+        .collect())
 }
 
 /// Resolved series/episode metadata for a watch event.

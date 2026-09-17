@@ -148,6 +148,9 @@ async fn hydrate_inner(
     // filtered per-episode at read time.
     let mut seasons_hydrated = 0usize;
     let mut episodes_written = 0usize;
+    // Earliest season premiering after today (numbered only): fetched too so
+    // release calendars have data even before anyone opens the season.
+    let mut next_unaired: Option<&tmdb::TmdbSeason> = None;
     for season in details.seasons.iter() {
         let is_special = season.season_number == 0;
         let aired = is_special
@@ -156,49 +159,32 @@ async fn hydrate_inner(
                 None => finished,
             };
         if !aired {
+            if !is_special {
+                let is_earlier = match (&next_unaired, &season.air_date) {
+                    (None, Some(_)) => true,
+                    (Some(current), Some(candidate)) => {
+                        candidate.as_str() < current.air_date.as_deref().unwrap_or("")
+                    }
+                    _ => false,
+                };
+                if is_earlier {
+                    next_unaired = Some(season);
+                }
+            }
             continue;
         }
 
-        let detail = match tmdb::get_tv_season_detail(tmdb_id, season.season_number).await {
-            Ok(detail) => detail,
-            Err(e) => {
-                tracing::warn!(
-                    "Season {}/{} hydrate failed: {}",
-                    tmdb_id,
-                    season.season_number,
-                    e
-                );
-                continue;
-            }
-        };
+        let (s, e) =
+            fetch_and_persist_season(client, table, &canonical_id, tmdb_id, season).await?;
+        seasons_hydrated += s;
+        episodes_written += e;
+    }
 
-        let season_id = db::season_id(tmdb_id, season.season_number);
-        let episodes: Vec<Episode> = detail
-            .episodes
-            .into_iter()
-            .map(|e| Episode {
-                id: format!("epi_{}", e.id),
-                series_id: canonical_id.clone(),
-                season_id: season_id.clone(),
-                tmdb_id: Some(e.id),
-                episode_number: e.episode_number,
-                name: e.name,
-                overview: e.overview,
-                still_path: e.still_path,
-                air_date: e.air_date,
-                runtime: e.runtime,
-                vote_average: e.vote_average,
-                status: None,
-            })
-            .collect();
-
-        db::upsert_episodes(client, table, &canonical_id, &season_id, season.season_number, &episodes)
-            .await?;
-        db::upsert_season_meta(client, table, &canonical_id, season.season_number, episodes.len() as i32)
-            .await?;
-
-        seasons_hydrated += 1;
-        episodes_written += episodes.len();
+    if let Some(season) = next_unaired {
+        let (s, e) =
+            fetch_and_persist_season(client, table, &canonical_id, tmdb_id, season).await?;
+        seasons_hydrated += s;
+        episodes_written += e;
     }
 
     if let Some(providers) = country_providers(&details) {
@@ -228,6 +214,63 @@ async fn hydrate_inner(
         episodes_written,
         skipped: false,
     })
+}
+
+/// Fetch one season from TMDB and persist its episodes + meta.
+/// Returns `(seasons_hydrated, episodes_written)` — `(0, 0)` when the TMDB
+/// call fails (the season is skipped, never fatal). Errors from DynamoDB
+/// itself still propagate.
+/// Fetch one season from TMDB and persist its episodes + meta.
+/// A failed TMDB call skips the season (`Ok((0, 0))`); DynamoDB errors
+/// propagate so the hydrate run fails visibly instead of stamping COMPLETE
+/// with missing seasons.
+async fn fetch_and_persist_season(
+    client: &Client,
+    table: &str,
+    canonical_id: &str,
+    tmdb_id: i64,
+    season: &tmdb::TmdbSeason,
+) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
+    let detail = match tmdb::get_tv_season_detail(tmdb_id, season.season_number).await {
+        Ok(detail) => detail,
+        Err(e) => {
+            tracing::warn!(
+                "Season {}/{} hydrate failed: {}",
+                tmdb_id,
+                season.season_number,
+                e
+            );
+            return Ok((0, 0));
+        }
+    };
+
+    let season_id = db::season_id(tmdb_id, season.season_number);
+    let episodes: Vec<Episode> = detail
+        .episodes
+        .into_iter()
+        .map(|e| Episode {
+            id: format!("epi_{}", e.id),
+            series_id: canonical_id.to_string(),
+            season_id: season_id.clone(),
+            tmdb_id: Some(e.id),
+            episode_number: e.episode_number,
+            name: e.name,
+            overview: e.overview,
+            still_path: e.still_path,
+            air_date: e.air_date,
+            runtime: e.runtime,
+            vote_average: e.vote_average,
+            status: None,
+        })
+        .collect();
+
+    let count = episodes.len();
+    db::upsert_episodes(client, table, canonical_id, &season_id, season.season_number, &episodes)
+        .await?;
+    db::upsert_season_meta(client, table, canonical_id, season.season_number, count as i32)
+        .await?;
+
+    Ok((1, count))
 }
 
 /// Providers for the configured country, in the canonical structured shape.
