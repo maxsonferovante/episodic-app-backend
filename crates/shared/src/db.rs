@@ -659,7 +659,7 @@ pub async fn get_cached_series(client: &Client, table: &str, tmdb_id: i64) -> Re
         None => return Ok(None),
     };
 
-    if is_cache_expired(&item) {
+    if is_cache_expired(item) {
         return Ok(None);
     }
 
@@ -916,7 +916,7 @@ pub async fn get_cached_providers(
         None => return Ok(None),
     };
 
-    if is_cache_expired(&item) {
+    if is_cache_expired(item) {
         return Ok(None);
     }
 
@@ -1013,7 +1013,7 @@ pub async fn get_cached_search(
         None => return Ok(None),
     };
 
-    if is_cache_expired(&item) {
+    if is_cache_expired(item) {
         return Ok(None);
     }
 
@@ -1446,6 +1446,19 @@ pub fn weekday_name(date: &str) -> String {
         .unwrap_or_default()
 }
 
+/// One releases row: (air_date, series_id, series_name, poster_path,
+/// season_number, episode_number, episode_id, episode_name).
+type ReleaseRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    i32,
+    i32,
+    String,
+    String,
+);
+
 pub async fn get_upcoming(client: &Client, table: &str, user_id: &str) -> Result<Vec<UpcomingItem>, aws_sdk_dynamodb::Error> {
     let lib_result = client
         .query()
@@ -1556,8 +1569,7 @@ pub async fn get_releases(
         .await?;
 
     // (air_date, series_id, series_name, poster, season, episode, id, name).
-    let mut items: Vec<(String, String, String, Option<String>, i32, i32, String, String)> =
-        Vec::new();
+    let mut items: Vec<ReleaseRow> = Vec::new();
 
     for lib_item in lib_result.items() {
         let series_id = get_str(lib_item, "seriesId").to_string();

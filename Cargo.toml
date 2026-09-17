@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/shared",
+    "crates/cursor-crypto",
     "crates/google-auth-lambda",
     "crates/authorizer-lambda",
     "crates/catalog-lambda",
@@ -18,6 +19,11 @@ edition = "2021"
 rust-version = "1.75"
 
 [workspace.dependencies]
+aes = "0.8"
+base64 = "0.22"
+cbc = "0.1"
+cipher = "0.4"
+hmac = "0.12"
 lambda_http = "0.12"
 lambda_runtime = "0.12"
 tokio = { version = "1", features = ["full"] }
@@ -30,6 +36,8 @@ aws-config = { version = "1", features = ["rustls"] }
 aws-sdk-dynamodb = { version = "1", features = ["rustls"] }
 aws-sdk-sqs = { version = "1", features = ["rustls"] }
 jsonwebtoken = "9"
+rand = "0.9"
+sha2 = "0.10"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

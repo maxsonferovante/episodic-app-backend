@@ -1,0 +1,14 @@
+[package]
+name = "cursor-crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aes.workspace = true
+base64.workspace = true
+cbc = { workspace = true, features = ["alloc"] }
+cipher.workspace = true
+hmac.workspace = true
+rand.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
