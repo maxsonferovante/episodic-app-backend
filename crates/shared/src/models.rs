@@ -298,6 +298,8 @@ pub mod dashboard {
         pub episode: EpisodeRef,
         pub series: SeriesRef,
         pub watched_at: String,
+        /// What happened: `MARK_WATCHED` or `UNMARK_WATCHED`.
+        pub event_type: String,
     }
 
     #[derive(Debug, Serialize, Deserialize)]

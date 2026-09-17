@@ -1645,6 +1645,7 @@ struct WatchEventMeta {
     episode_name: String,
     season_number: i32,
     episode_number: i32,
+    event_type: String,
 }
 
 /// Resolve a watch event's metadata, filling any gaps from the episode/series
@@ -1694,6 +1695,7 @@ async fn resolve_watch_event(
         episode_name,
         season_number,
         episode_number,
+        event_type: get_str(item, "eventType").to_string(),
     })
 }
 
@@ -1729,6 +1731,7 @@ pub async fn get_recent_history(client: &Client, table: &str, user_id: &str) -> 
                 poster_path: meta.poster_path,
             },
             watched_at,
+            event_type: meta.event_type,
         });
     }
 
@@ -1742,21 +1745,28 @@ pub async fn get_history_page(
     cursor: Option<&str>,
     limit: i32,
 ) -> Result<HistoryResponse, aws_sdk_dynamodb::Error> {
+    // Keyset pagination: SKs are `EVT#<millis>#<id>` (time-ordered) and the
+    // read is descending, so "next page" is simply `SK < cursor`. This avoids
+    // ExclusiveStartKey entirely. Non-EVT# rows (PROFILE/LIB#/PROG#) all sort
+    // above any EVT# cursor, so they can never leak into a page.
     let mut query = client
         .query()
         .table_name(table)
-        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
         .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)))
-        .expression_attribute_values(":sk_prefix", AttributeValue::S("EVT#".to_string()))
         .scan_index_forward(false)
         .limit(limit + 1);
 
     if let Some(cursor_val) = cursor {
-        let exclusive_start_key = HashMap::from([
-            ("PK".to_string(), AttributeValue::S(format!("USR#{}", user_id))),
-            ("SK".to_string(), AttributeValue::S(cursor_val.to_string())),
-        ]);
-        query = query.set_exclusive_start_key(Some(exclusive_start_key));
+        query = query
+            .key_condition_expression("PK = :pk AND SK < :cursor")
+            .expression_attribute_values(
+                ":cursor",
+                AttributeValue::S(cursor_val.to_string()),
+            );
+    } else {
+        query = query
+            .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
+            .expression_attribute_values(":sk_prefix", AttributeValue::S("EVT#".to_string()));
     }
 
     let result = query.send().await?;
@@ -1788,6 +1798,7 @@ pub async fn get_history_page(
                 poster_path: meta.poster_path,
             },
             watched_at,
+            event_type: meta.event_type,
         });
     }
 
