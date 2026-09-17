@@ -35,14 +35,26 @@ fn normalize_series_id(series_id: &str) -> String {
     }
 }
 
-/// Episode total used as the percentage denominator. Prefer the stored aired
-/// count (which now includes specials, matching the catalog and library views),
-/// falling back to the TMDB series total when no episodes are cached yet.
+/// Episode total used as the percentage denominator: the sum of every
+/// season's episodes (specials included), so it never shrinks to whichever
+/// seasons happen to have cached episode rows. Falls back to the stored
+/// aired/META totals when no seasons are cached.
 async fn series_episode_total(
     client: &db::Client,
     table: &str,
     series_id: &str,
 ) -> Result<i32, AppError> {
+    if let Some(tmdb_id) = series_id
+        .strip_prefix("ser_")
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        if let Ok(seasons) = db::get_cached_seasons(client, table, tmdb_id).await {
+            let total: i32 = seasons.iter().map(|s| s.episode_count).sum();
+            if total > 0 {
+                return Ok(total);
+            }
+        }
+    }
     let (aired, _) = db::get_aired_counts(client, table, series_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;

@@ -1,6 +1,6 @@
 use lambda_http::{Body, Request, Response};
 use shared::auth::extract_user_id;
-use shared::db::{get_client, get_library_item, add_to_library, remove_from_library, list_library, get_series_meta, count_watched_in_series, get_series_total_episodes, get_aired_counts};
+use shared::db::{get_client, get_library_item, add_to_library, remove_from_library, list_library, get_series_meta, count_watched_in_series, get_series_total_episodes, get_aired_counts, get_cached_seasons};
 use shared::error::{AppError, app_error_response as error_response, add_cors};
 use shared::id;
 use shared::models::library::LibraryItem;
@@ -27,6 +27,34 @@ fn normalize_series_id(id: &str) -> String {
 
 fn extract_tmdb_id(series_id: &str) -> Option<i64> {
     series_id.strip_prefix("ser_")?.parse().ok()
+}
+
+/// Card total: the sum of every cached season's episodes (specials
+/// included), so it never shrinks to whichever seasons happen to have
+/// cached episode rows. Falls back to the aired/META totals when no
+/// seasons are cached.
+async fn series_card_total(
+    client: &shared::db::Client,
+    table: &str,
+    series_id: &str,
+) -> i32 {
+    if let Some(tmdb_id) = extract_tmdb_id(series_id) {
+        if let Ok(seasons) = get_cached_seasons(client, table, tmdb_id).await {
+            let total: i32 = seasons.iter().map(|s| s.episode_count).sum();
+            if total > 0 {
+                return total;
+            }
+        }
+    }
+    let (aired, _) = get_aired_counts(client, table, series_id)
+        .await
+        .unwrap_or((0, Default::default()));
+    if aired > 0 {
+        return aired;
+    }
+    get_series_total_episodes(client, table, series_id)
+        .await
+        .unwrap_or(0)
 }
 
 pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
@@ -91,16 +119,11 @@ async fn handle_list_library(req: Request) -> Result<Response<Body>, AppError> {
             let watched = count_watched_in_series(client, table, &user_id, &series_id)
                 .await
                 .unwrap_or(0);
-            let (aired, _) = get_aired_counts(client, table, &series_id)
-                .await
-                .unwrap_or((0, Default::default()));
-            let total = if aired > 0 {
-                aired
-            } else {
-                get_series_total_episodes(client, table, &series_id)
-                    .await
-                    .unwrap_or(0)
-            };
+            // Card total: sum of every cached season's episodes (specials
+            // included), so it never shrinks to whichever seasons happen to
+            // have cached episode rows. Falls back to the aired/META totals
+            // when no seasons are cached.
+            let total = series_card_total(client, table, &series_id).await;
             let percentage = if total > 0 {
                 (((watched as f64 / total as f64) * 100.0).round() as i64).min(100)
             } else {

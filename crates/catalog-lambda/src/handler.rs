@@ -203,22 +203,39 @@ async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Re
         }
     }
 
-    // 3. Watch progress over *aired* episodes only, so upcoming episodes don't
-    //    count against progress and the UI never fans out over every season.
+    // 3. Per-season aired counts prefer cached episode rows, falling back
+    //    to each season's known episode count.
     let series_id = db::series_id(tmdb_id);
-    let (aired_total, aired_by_season) = db::get_aired_counts(&client, &table, &series_id)
-        .await
-        .unwrap_or((0, std::collections::HashMap::new()));
+    let season_totals: std::collections::HashMap<i32, i32> =
+        match db::get_aired_counts(&client, &table, &series_id).await {
+            Ok((_, by_season)) if !by_season.is_empty() => seasons
+                .iter()
+                .map(|s| {
+                    let count = by_season
+                        .get(&s.season_number)
+                        .copied()
+                        .unwrap_or(s.episode_count);
+                    (s.season_number, count)
+                })
+                .collect(),
+            _ => seasons
+                .iter()
+                .map(|s| (s.season_number, s.episode_count))
+                .collect(),
+        };
 
-    let (total_episodes, season_totals) = if aired_total > 0 {
-        (aired_total, aired_by_season)
-    } else {
-        // No cached episodes yet: fall back to the known totals.
-        let total = db::get_series_total_episodes(&client, &table, &series_id)
+    // Global series total: the sum of every season's episodes (specials
+    // included), so progress always reads "watched of N" for the whole
+    // series. Cached episode rows only exist for seasons somebody already
+    // opened, so deriving the total from them would shrink it to the
+    // browsed seasons. Falls back to the stored series total when the
+    // season list is empty.
+    let total_episodes: i32 = if seasons.is_empty() {
+        db::get_series_total_episodes(&client, &table, &series_id)
             .await
-            .unwrap_or(0);
-        let map = seasons.iter().map(|s| (s.season_number, s.episode_count)).collect();
-        (total, map)
+            .unwrap_or(0)
+    } else {
+        season_totals.values().sum()
     };
 
     let mut watched_by_season: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
