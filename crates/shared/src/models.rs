@@ -207,6 +207,12 @@ pub mod progress {
     pub struct SeriesProgress {
         pub series_percentage: f64,
         pub season_percentage: f64,
+        /// Exact counts behind the percentages, so callers can update cached
+        /// series/season totals without an extra round-trip.
+        pub watched_episodes: i32,
+        pub total_episodes: i32,
+        pub season_watched_episodes: i32,
+        pub season_total_episodes: i32,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]

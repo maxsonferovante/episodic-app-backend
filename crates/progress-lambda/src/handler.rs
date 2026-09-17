@@ -165,6 +165,10 @@ async fn handle_get_progress(
         progress: SeriesProgress {
             series_percentage: (series_pct * 10.0).round() / 10.0,
             season_percentage: (season_pct * 10.0).round() / 10.0,
+            watched_episodes: watched_count,
+            total_episodes,
+            season_watched_episodes: season_watched,
+            season_total_episodes: season_total,
         },
         next_episode,
     };
@@ -287,11 +291,41 @@ async fn handle_season_progress(
         result.map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
+    // Recompute the caller's totals so the client can update every progress
+    // surface without refetching the series and season. Only aired episodes
+    // were (un)marked above; the totals below cover the whole series.
+    let watched_count = db::count_watched_in_series(client, table, user_id, &series_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let total_episodes = series_episode_total(client, table, &series_id).await?;
+    let season_watched = db::count_watched_in_season(client, table, user_id, &series_id, season_number)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let season_total = db::get_season_episode_count(client, table, &series_id, season_number)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let percentage = if total_episodes > 0 {
+        (((watched_count as f64 / total_episodes as f64) * 100.0).round() as i64).min(100)
+    } else {
+        0
+    };
+
     let body = json!({
         "seriesId": series_id,
         "seasonNumber": season_number,
         "watched": watched,
         "updatedEpisodes": episodes.len(),
+        "updatedEpisodeNumbers": episodes,
+        "progress": {
+            "watchedEpisodes": watched_count,
+            "totalEpisodes": total_episodes,
+            "percentage": percentage,
+        },
+        "season": {
+            "seasonNumber": season_number,
+            "watchedEpisodes": season_watched,
+            "episodeCount": season_total,
+        },
     });
 
     let mut resp = Response::builder()
@@ -357,6 +391,10 @@ async fn build_progress_response(
         progress: SeriesProgress {
             series_percentage: (series_pct * 10.0).round() / 10.0,
             season_percentage: (season_pct * 10.0).round() / 10.0,
+            watched_episodes: watched_count,
+            total_episodes,
+            season_watched_episodes: season_watched,
+            season_total_episodes: season_total,
         },
         next_episode,
     })
