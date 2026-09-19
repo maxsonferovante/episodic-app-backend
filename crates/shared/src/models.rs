@@ -303,13 +303,6 @@ pub mod dashboard {
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
-    pub struct DashboardResponse {
-        pub upcoming: Vec<UpcomingItem>,
-        pub recent_history: Vec<HistoryItem>,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
     pub struct HistoryResponse {
         pub items: Vec<HistoryItem>,
         pub next_cursor: Option<String>,

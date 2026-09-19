@@ -1639,11 +1639,7 @@ fn months_in_window(from: &str, to: &str) -> Vec<String> {
     let mut months = Vec::new();
     let (mut year, mut month) = (start.year(), start.month());
 
-    loop {
-        let first = match chrono::NaiveDate::from_ymd_opt(year, month, 1) {
-            Some(date) => date,
-            None => break,
-        };
+    while let Some(first) = chrono::NaiveDate::from_ymd_opt(year, month, 1) {
         if first >= end {
             break;
         }
@@ -1679,92 +1675,6 @@ type ReleaseRow = (
     String,
     String,
 );
-
-pub async fn get_upcoming(client: &Client, table: &str, user_id: &str) -> Result<Vec<UpcomingItem>, aws_sdk_dynamodb::Error> {
-    let lib_result = client
-        .query()
-        .table_name(table)
-        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)))
-        .expression_attribute_values(":sk_prefix", AttributeValue::S("LIB#".to_string()))
-        .send()
-        .await?;
-
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-
-    let mut upcoming = Vec::new();
-
-    for lib_item in lib_result.items() {
-        let series_id = get_str(lib_item, "seriesId").to_string();
-        let mut series_name = get_str(lib_item, "name").to_string();
-        let mut poster_path = get_opt_str(lib_item, "posterPath").map(|s| s.to_string());
-        if series_name.is_empty() || poster_path.is_none() {
-            let (name, poster) = get_series_ref(client, table, &series_id).await?;
-            if series_name.is_empty() {
-                series_name = name;
-            }
-            if poster_path.is_none() {
-                poster_path = poster;
-            }
-        }
-
-        let ep_result = client
-            .query()
-            .table_name(table)
-            .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-            .expression_attribute_values(":pk", AttributeValue::S(format!("SER#{}", series_id)))
-            .expression_attribute_values(":sk_prefix", AttributeValue::S("EP#".to_string()))
-            .send()
-            .await?;
-
-        // Only the next (earliest) upcoming episode per series.
-        let mut next: Option<(String, i32, i32, String, String)> = None;
-        for ep_item in ep_result.items() {
-            let air_date = match get_opt_str(ep_item, "airDate") {
-                Some(d) => d.to_string(),
-                None => continue,
-            };
-            if air_date.as_str() < today.as_str() {
-                continue;
-            }
-            let is_earlier = match &next {
-                None => true,
-                Some((current, ..)) => air_date.as_str() < current.as_str(),
-            };
-            if is_earlier {
-                next = Some((
-                    air_date,
-                    get_i32(ep_item, "seasonNumber"),
-                    get_i32(ep_item, "episodeNumber"),
-                    get_str(ep_item, "id").to_string(),
-                    get_str(ep_item, "name").to_string(),
-                ));
-            }
-        }
-
-        if let Some((air_date, season_number, episode_number, episode_id, episode_name)) = next {
-            let weekday = weekday_name(&air_date);
-            upcoming.push(UpcomingItem {
-                series: SeriesRef {
-                    id: series_id,
-                    name: series_name,
-                    poster_path,
-                },
-                episode: EpisodeRef {
-                    id: episode_id,
-                    season_number,
-                    episode_number,
-                    name: episode_name,
-                },
-                air_date,
-                weekday,
-            });
-        }
-    }
-
-    upcoming.sort_by(|a, b| a.air_date.cmp(&b.air_date));
-    Ok(upcoming)
-}
 
 /// Cap for a single releases query so one call can't balloon the payload.
 pub const MAX_RELEASE_ITEMS: usize = 300;
@@ -1993,45 +1903,6 @@ async fn resolve_watch_event(
         episode_number,
         event_type: get_str(item, "eventType").to_string(),
     })
-}
-
-pub async fn get_recent_history(client: &Client, table: &str, user_id: &str) -> Result<Vec<HistoryItem>, aws_sdk_dynamodb::Error> {
-    let result = client
-        .query()
-        .table_name(table)
-        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)))
-        .expression_attribute_values(":sk_prefix", AttributeValue::S("EVT#".to_string()))
-        .scan_index_forward(false)
-        .limit(10)
-        .send()
-        .await?;
-
-    let items = result.items();
-    let mut history = Vec::with_capacity(items.len());
-
-    for item in items {
-        let watched_at = get_str(item, "occurredAt").to_string();
-        let meta = resolve_watch_event(client, table, item).await?;
-
-        history.push(HistoryItem {
-            episode: EpisodeRef {
-                id: meta.episode_id,
-                season_number: meta.season_number,
-                episode_number: meta.episode_number,
-                name: meta.episode_name,
-            },
-            series: SeriesRef {
-                id: meta.series_id,
-                name: meta.series_name,
-                poster_path: meta.poster_path,
-            },
-            watched_at,
-            event_type: meta.event_type,
-        });
-    }
-
-    Ok(history)
 }
 
 pub async fn get_history_page(

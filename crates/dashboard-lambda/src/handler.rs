@@ -1,6 +1,6 @@
 use lambda_http::{Body, Request, Response};
 use shared::auth::extract_user_id;
-use shared::db::{get_client, get_upcoming, get_releases, get_recent_history, get_history_page, get_calendar};
+use shared::db::{get_client, get_releases, get_history_page, get_calendar};
 use shared::error::{AppError, app_error_response, add_cors};
 
 fn get_table_name() -> Result<String, AppError> {
@@ -45,7 +45,6 @@ pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std:
     let path = req.uri().path();
 
     let result = match method {
-        "GET" if path.ends_with("/dashboard") => handle_dashboard(req).await,
         "GET" if path.ends_with("/history") => handle_history(req).await,
         "GET" if path.ends_with("/calendar") => handle_calendar(req).await,
         "GET" if path.ends_with("/releases") => handle_releases(req).await,
@@ -56,33 +55,6 @@ pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std:
         Ok(resp) => Ok(resp),
         Err(e) => Ok(app_error_response(e)),
     }
-}
-
-async fn handle_dashboard(req: Request) -> Result<Response<Body>, AppError> {
-    let user_id = extract_user_id(&req)?;
-    let table = get_table_name()?;
-    let client = get_client().await;
-
-    let (upcoming, recent_history) = tokio::try_join!(
-        get_upcoming(&client, &table, &user_id),
-        get_recent_history(&client, &table, &user_id),
-    ).map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let response = shared::models::dashboard::DashboardResponse {
-        upcoming,
-        recent_history,
-    };
-
-    let body = serde_json::to_string(&response)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let mut resp = Response::builder()
-        .status(200)
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap();
-    add_cors(&mut resp);
-    Ok(resp)
 }
 
 async fn handle_history(req: Request) -> Result<Response<Body>, AppError> {
