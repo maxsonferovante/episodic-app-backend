@@ -218,16 +218,15 @@ async fn handle_series_details(path: &str, user_id: Option<String>) -> Result<Re
 
     // Global series total: the sum of every season's episodes (specials
     // included), so progress always reads "watched of N" for the whole
-    // series. Cached episode rows only exist for seasons somebody already
-    // opened, so deriving the total from them would shrink it to the
-    // browsed seasons. Falls back to the stored series total when the
-    // season list is empty.
+    // series. `season_totals` is the *aired* count and is only used for the
+    // per-season `airedEpisodes` display. Falls back to the stored series
+    // total when the season list is empty.
     let total_episodes: i32 = if seasons.is_empty() {
         db::get_series_total_episodes(&client, &table, &series_id)
             .await
             .unwrap_or(0)
     } else {
-        season_totals.values().sum()
+        seasons.iter().map(|s| s.episode_count).sum()
     };
 
     let mut watched_by_season: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();

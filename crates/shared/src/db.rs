@@ -73,6 +73,16 @@ fn get_i32(item: &HashMap<String, AttributeValue>, key: &str) -> i32 {
         .unwrap_or(0)
 }
 
+/// Canonical episode total for a `SER#` META row: the `totalEpisodes` rollup
+/// (every season summed, specials included) when present, else TMDB's own
+/// `numberOfEpisodes` (which excludes specials).
+fn series_total_from_meta(item: &HashMap<String, AttributeValue>) -> i32 {
+    item.get("totalEpisodes")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or_else(|| get_i32(item, "numberOfEpisodes"))
+}
+
 pub async fn get_user_by_email(client: &Client, table: &str, email: &str) -> Result<Option<User>, aws_sdk_dynamodb::Error> {
     let result = client
         .query()
@@ -239,7 +249,7 @@ pub async fn get_series_meta(
                 poster_path: get_opt_str(item, "posterPath").map(str::to_string),
                 first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
                 status: get_opt_str(item, "status").map(str::to_string),
-                total_episodes: get_i32(item, "numberOfEpisodes"),
+                total_episodes: series_total_from_meta(item),
             }));
         }
     }
@@ -297,7 +307,7 @@ pub async fn get_series_meta_bulk(
                     poster_path: get_opt_str(item, "posterPath").map(str::to_string),
                     first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
                     status: get_opt_str(item, "status").map(str::to_string),
-                    total_episodes: get_i32(item, "numberOfEpisodes"),
+                    total_episodes: series_total_from_meta(item),
                 },
             );
         }
@@ -1304,6 +1314,23 @@ pub async fn cache_seasons(
             .put_item()
             .table_name(table)
             .set_item(Some(item))
+            .send()
+            .await?;
+    }
+
+    // Canonical series total: the sum of every season (specials included), so
+    // the library, the series detail and the progress endpoints all share one
+    // denominator. `numberOfEpisodes` stays as TMDB's own (specials-excluded)
+    // count and is only a fallback.
+    if !seasons.is_empty() {
+        let total: i32 = seasons.iter().map(|s| s.episode_count).sum();
+        client
+            .update_item()
+            .table_name(table)
+            .key("PK", AttributeValue::S(format!("SER#{}", series_id(tmdb_id))))
+            .key("SK", AttributeValue::S("META".to_string()))
+            .update_expression("SET totalEpisodes = :t")
+            .expression_attribute_values(":t", AttributeValue::N(total.to_string()))
             .send()
             .await?;
     }
