@@ -1810,6 +1810,30 @@ pub async fn get_releases(
         return Ok(Vec::new());
     }
 
+    // A library row added without a payload carries no name/poster snapshot.
+    // Fill those gaps from the canonical series meta in one batch instead of
+    // one lookup per series.
+    let incomplete: Vec<String> = library
+        .iter()
+        .filter(|(_, (name, poster))| name.is_empty() || poster.is_none())
+        .map(|(series_id, _)| series_id.clone())
+        .collect();
+
+    if !incomplete.is_empty() {
+        if let Ok(metas) = get_series_meta_bulk(client, table, &incomplete).await {
+            for (series_id, meta) in metas {
+                if let Some((name, poster)) = library.get_mut(&series_id) {
+                    if name.is_empty() {
+                        *name = meta.name;
+                    }
+                    if poster.is_none() {
+                        *poster = meta.poster_path;
+                    }
+                }
+            }
+        }
+    }
+
     // (air_date, series_id, series_name, poster, season, episode, id, name).
     let mut items: Vec<ReleaseRow> = Vec::new();
 
