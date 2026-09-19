@@ -1,8 +1,7 @@
 use lambda_http::{Body, Request, Response};
 use shared::auth::extract_user_id;
-use shared::db::{get_client, get_continue_watching, get_upcoming, get_releases, get_recent_history, get_history_page, get_calendar};
+use shared::db::{get_client, get_upcoming, get_releases, get_recent_history, get_history_page, get_calendar};
 use shared::error::{AppError, app_error_response, add_cors};
-use serde_json::json;
 
 fn get_table_name() -> Result<String, AppError> {
     std::env::var("DYNAMODB_TABLE_NAME")
@@ -64,14 +63,12 @@ async fn handle_dashboard(req: Request) -> Result<Response<Body>, AppError> {
     let table = get_table_name()?;
     let client = get_client().await;
 
-    let (continue_watching, upcoming, recent_history) = tokio::try_join!(
-        get_continue_watching(&client, &table, &user_id),
+    let (upcoming, recent_history) = tokio::try_join!(
         get_upcoming(&client, &table, &user_id),
         get_recent_history(&client, &table, &user_id),
     ).map_err(|e| AppError::Internal(e.to_string()))?;
 
     let response = shared::models::dashboard::DashboardResponse {
-        continue_watching,
         upcoming,
         recent_history,
     };

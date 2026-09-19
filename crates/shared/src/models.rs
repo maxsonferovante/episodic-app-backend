@@ -274,20 +274,6 @@ pub mod dashboard {
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
-    pub struct ContinueWatchingItem {
-        pub series: SeriesRef,
-        pub next_episode: EpisodeRef,
-        pub progress: ProgressInfo,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct ProgressInfo {
-        pub percentage: f64,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
     pub struct UpcomingItem {
         pub series: SeriesRef,
         pub episode: EpisodeRef,
@@ -318,7 +304,6 @@ pub mod dashboard {
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct DashboardResponse {
-        pub continue_watching: Vec<ContinueWatchingItem>,
         pub upcoming: Vec<UpcomingItem>,
         pub recent_history: Vec<HistoryItem>,
     }

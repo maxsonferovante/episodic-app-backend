@@ -14,13 +14,6 @@ pub mod watch_event_type {
     pub const UNMARK_WATCHED: &str = "UNMARK_WATCHED";
 }
 
-/// Library entry status values.
-pub mod library_status {
-    pub const IN_PROGRESS: &str = "IN_PROGRESS";
-    pub const CAUGHT_UP: &str = "CAUGHT_UP";
-    pub const COMPLETED: &str = "COMPLETED";
-}
-
 /// TMDB `status` values, as returned by `/tv/{id}`.
 pub mod series_status {
     pub const RETURNING: &str = "Returning Series";

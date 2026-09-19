@@ -1599,75 +1599,14 @@ pub async fn list_library(
     Ok(items)
 }
 
-fn get_num(item: &HashMap<String, AttributeValue>, key: &str) -> f64 {
-    item.get(key)
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<f64>().ok())
-        .unwrap_or(0.0)
-}
-
 fn get_opt_str<'a>(item: &'a HashMap<String, AttributeValue>, key: &str) -> Option<&'a str> {
     item.get(key).and_then(|v| v.as_s().ok()).map(|s| s.as_str())
 }
 
-pub async fn get_continue_watching(client: &Client, table: &str, user_id: &str) -> Result<Vec<ContinueWatchingItem>, aws_sdk_dynamodb::Error> {
-    let result = client
-        .query()
-        .table_name(table)
-        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)))
-        .expression_attribute_values(":sk_prefix", AttributeValue::S("LIB#".to_string()))
-        .filter_expression("#status = :in_progress")
-        .expression_attribute_names("#status", "status")
-        .expression_attribute_values(":in_progress", AttributeValue::S(crate::enums::library_status::IN_PROGRESS.to_string()))
-        .limit(10)
-        .send()
-        .await?;
-
-    let items = result.items();
-    let mut continue_watching = Vec::with_capacity(items.len());
-
-    for item in items {
-        let series_id = get_str(item, "seriesId").to_string();
-        let mut series_name = get_str(item, "seriesName").to_string();
-        let mut poster_path = get_opt_str(item, "posterPath").map(|s| s.to_string());
-        if series_name.is_empty() || poster_path.is_none() {
-            let (name, poster) = get_series_ref(client, table, &series_id).await?;
-            if series_name.is_empty() {
-                series_name = name;
-            }
-            if poster_path.is_none() {
-                poster_path = poster;
-            }
-        }
-        let percentage = get_num(item, "percentage");
-
-        let next_episode_id = get_str(item, "nextEpisodeId").to_string();
-        let next_season = get_i32(item, "nextSeasonNumber");
-        let next_episode = get_i32(item, "nextEpisodeNumber");
-        let next_episode_name = get_str(item, "nextEpisodeName").to_string();
-
-        if next_episode_id.is_empty() {
-            continue;
-        }
-
-        continue_watching.push(ContinueWatchingItem {
-            series: SeriesRef {
-                id: series_id,
-                name: series_name,
-                poster_path,
-            },
-            next_episode: EpisodeRef {
-                id: next_episode_id,
-                season_number: next_season,
-                episode_number: next_episode,
-                name: next_episode_name,
-            },
-            progress: ProgressInfo { percentage },
-        });
-    }
-
-    Ok(continue_watching)
+/// Midnight UTC of a `YYYY-MM-DD` date, in epoch milliseconds.
+fn date_to_millis(date: &str) -> Option<i64> {
+    let naive = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    Some(naive.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis())
 }
 
 /// English weekday name ("Monday".."Sunday") for a `YYYY-MM-DD` date.
@@ -1707,7 +1646,7 @@ pub async fn get_upcoming(client: &Client, table: &str, user_id: &str) -> Result
 
     for lib_item in lib_result.items() {
         let series_id = get_str(lib_item, "seriesId").to_string();
-        let mut series_name = get_str(lib_item, "seriesName").to_string();
+        let mut series_name = get_str(lib_item, "name").to_string();
         let mut poster_path = get_opt_str(lib_item, "posterPath").map(|s| s.to_string());
         if series_name.is_empty() || poster_path.is_none() {
             let (name, poster) = get_series_ref(client, table, &series_id).await?;
@@ -1805,7 +1744,7 @@ pub async fn get_releases(
 
     for lib_item in lib_result.items() {
         let series_id = get_str(lib_item, "seriesId").to_string();
-        let mut series_name = get_str(lib_item, "seriesName").to_string();
+        let mut series_name = get_str(lib_item, "name").to_string();
         let mut poster_path = get_opt_str(lib_item, "posterPath").map(|s| s.to_string());
         if series_name.is_empty() || poster_path.is_none() {
             let (name, poster) = get_series_ref(client, table, &series_id).await?;
@@ -1907,7 +1846,14 @@ async fn resolve_watch_event(
     let mut season_number = get_i32(item, "seasonNumber");
     let mut episode_number = get_i32(item, "episodeNumber");
 
-    if series_id.is_empty() || season_number == 0 || episode_number == 0 {
+    // Older events were written without coordinates. Season 0 is a valid
+    // season (Specials), so test for the attribute's absence rather than a
+    // zero value — otherwise every special pays for a lookup it doesn't need.
+    let coords_missing = series_id.is_empty()
+        || !item.contains_key("seasonNumber")
+        || !item.contains_key("episodeNumber")
+        || episode_number == 0;
+    if coords_missing {
         if let Some((sid, sn, en)) = get_episode_by_id(client, table, &episode_id).await? {
             series_id = sid;
             season_number = sn;
@@ -1915,7 +1861,7 @@ async fn resolve_watch_event(
         }
     }
 
-    if episode_name.is_empty() && !series_id.is_empty() && season_number > 0 && episode_number > 0 {
+    if episode_name.is_empty() && !series_id.is_empty() && episode_number > 0 {
         if let Some(ep) = get_episode_item(client, table, &series_id, season_number, episode_number).await? {
             episode_name = get_str(&ep, "name").to_string();
         }
@@ -2063,13 +2009,18 @@ pub async fn get_history_page(
 }
 
 pub async fn get_calendar(client: &Client, table: &str, user_id: &str, from: &str, to: &str) -> Result<Vec<CalendarDay>, aws_sdk_dynamodb::Error> {
+    // Event SKs are `EVT#<millis>#<episodeId>`, so the window maps onto a
+    // bounded key range instead of reading every event the user ever wrote.
+    let from_millis = date_to_millis(from).unwrap_or(0);
+    let to_millis = date_to_millis(to).unwrap_or(i64::MAX);
+
     let result = client
         .query()
         .table_name(table)
-        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
+        .key_condition_expression("PK = :pk AND SK >= :start AND SK < :end")
         .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)))
-        .expression_attribute_values(":sk_prefix", AttributeValue::S("EVT#".to_string()))
-        .scan_index_forward(false)
+        .expression_attribute_values(":start", AttributeValue::S(format!("EVT#{}", from_millis)))
+        .expression_attribute_values(":end", AttributeValue::S(format!("EVT#{}", to_millis)))
         .send()
         .await?;
 
