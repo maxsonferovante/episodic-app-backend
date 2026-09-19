@@ -15,7 +15,7 @@ Cargo workspace (`crates/`):
 | `catalog-lambda` | TMDB search and series/seasons/episodes, cached in DynamoDB |
 | `library-lambda` | User library CRUD and per-series progress |
 | `progress-lambda` | Mark/unmark episodes (single or whole season) and watch events |
-| `dashboard-lambda` | Dashboard (continue watching, upcoming), history, calendar |
+| `dashboard-lambda` | Dashboard (`upcoming`, recent history), history, calendar, releases |
 | `sync-job` | Daily **scheduler**: scans library series and enqueues a hydrate message for the ones needing a refresh (never fetches TMDB itself) |
 | `hydrate-worker` | SQS consumer: fully hydrates one series from TMDB (details, seasons, episodes, providers) and persists it canonically |
 
@@ -39,7 +39,31 @@ TMDB is queried once per series and reused by every user:
   re-enqueues a series once its `nextAirDate` has passed or its cache expired.
 - The hydrate routine is idempotent and guarded by a conditional lock, so
   duplicate SQS deliveries are no-ops and concurrent workers don't stampede TMDB.
-- Specials (season 0) are skipped entirely.
+- Specials (season 0) are hydrated and count towards progress, so they are
+  part of the canonical episode total.
+
+## DynamoDB access pattern
+
+Read paths are shaped to cost a small, constant number of round trips:
+
+- **Progress**: one `PROG#<series>#` Query (`get_series_progress_map`) plus one
+  paginated `SER#<series>` partition read (`get_series_partition`: `META` +
+  `SN#` + `EP#`). The next unwatched episode and the watched counts are derived
+  in memory — no per-episode lookup.
+- **Library**: one `LIB#` Query + one `PROG#` Query
+  (`get_user_progress_counts`) + one `BatchGetItem` of the series `META`
+  (`get_series_meta_bulk`).
+- **Releases**: one `LIB#` Query + one bounded `GSI2` Query per month
+  (`get_releases`); the index keys are written by `upsert_episodes`.
+- **Calendar**: one key-range Query (`SK BETWEEN EVT#<from> AND EVT#<to>`).
+- **Search**: never cached — every search hits TMDB.
+- Season mark/unmark writes with `BatchWriteItem` (25 per batch, bounded retry
+  on unprocessed items) instead of one `PutItem` per episode.
+
+Totals: `META.totalEpisodes` is the sum of every season (specials included) and
+is the canonical denominator everywhere; `META.numberOfEpisodes` (TMDB,
+specials excluded) is only a fallback. `SN#` rows carry an `airedCount` rollup.
+Completion percentages use two decimals (`models::progress::completion_percentage`).
 
 ## Requirements
 
@@ -102,28 +126,42 @@ caller's user id.
 | GET | `/api/v1/episodes/{id}/progress` | Episode progress |
 | PUT | `/api/v1/episodes/{id}/progress` | Mark/unmark an episode — `{ "watched": true }` |
 | PUT | `/api/v1/episodes/season/{seriesId}/{n}/progress` | Mark/unmark a whole season (aired episodes only) |
-| GET | `/api/v1/dashboard` | Continue watching, upcoming, recent history |
+| GET | `/api/v1/dashboard` | `upcoming` + recent history (kept for API compatibility; the web app uses `/releases` and `/history`) |
+| GET | `/api/v1/releases?from=&to=` | Library episodes airing in the window (also `month=YYYY-MM`) |
 | GET | `/api/v1/history?cursor=&limit=` | Paginated watch history |
 | GET | `/api/v1/calendar?from=&to=` | Calendar of episodes (also accepts `month=YYYY-MM`) |
 
 ## Data model (DynamoDB)
 
-Single table with `PK` / `SK` and a `GSI1` (`GSI1PK` / `GSI1SK`). Highlights:
+Single table with `PK` / `SK` and two indexes: `GSI1` (`GSI1PK` / `GSI1SK`) and
+`GSI2` (`GSI2PK` / `GSI2SK`, the air-date index). Highlights:
 
 - `USR#<id>` / `PROFILE` — user (`GSI1PK = EMAIL#<email>`)
 - `USR#<id>` / `LIB#<seriesId>` — library item
 - `USR#<id>` / `PROG#<seriesId>#<ss>#<ee>` — watch progress
 - `USR#<id>` / `EVT#<ts>#<episodeId>` — watch events (history)
 - `SER#ser_<tmdb>` / `META` — canonical series metadata plus hydrate
-  bookkeeping (`hydrationStatus`, `hydratedAt`, `nextAirDate`, `expiresAt`)
-- `SER#ser_<tmdb>` / `SN#<ss>` — season metadata
+  bookkeeping (`hydrationStatus`, `hydratedAt`, `nextAirDate`, `expiresAt`) and
+  the canonical episode total `totalEpisodes`
+- `SER#ser_<tmdb>` / `SN#<ss>` — season metadata (`episodeCount` + `airedCount`)
 - `SER#ser_<tmdb>` / `EP#<ss>#<ee>` — episodes (`GSI1PK = <episodeId>` so the
-  progress lambda can resolve an episode id back to series/season/episode)
+  progress lambda can resolve an episode id back to series/season/episode;
+  `GSI2PK = AIR#<YYYY-MM>` / `GSI2SK = <date>#<series>#S#E` for release windows)
 - `SER#ser_<tmdb>` / `PROVIDERS` — watch providers for `TMDB_COUNTRY`
-- `SEARCH#<query>#<page>` / `RESULTS` — short-lived search cache (1h)
 
 All series data is global and keyed by the deterministic id `ser_<tmdb>`; there
-is no per-user copy.
+is no per-user copy. Search results are **not** cached.
+
+## Scripts
+
+| Script | Purpose |
+| --- | --- |
+| `scripts/deploy-all.sh` | Build (musl) + deploy the lambdas |
+| `scripts/backfill-specials.sh` | Force-rehydrate series so specials are persisted |
+| `scripts/backfill-season-rollups.py` | Fill `SN#.airedCount` and `META.totalEpisodes` |
+| `scripts/backfill-air-index.py` | Fill `GSI2PK`/`GSI2SK` on existing `EP#` rows |
+
+The backfills are additive and idempotent; run them with `DRY_RUN=1` first.
 
 ## Conventions
 
