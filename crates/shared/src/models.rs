@@ -175,6 +175,19 @@ pub mod progress {
         }
     }
 
+    /// Completion percentage with two decimals, capped at 100.
+    ///
+    /// The single source of truth for every progress surface: long series with
+    /// many specials (e.g. Doctor Who, ~2000 episodes) must still show a
+    /// non-zero value once an episode is watched, which integer rounding hid.
+    pub fn completion_percentage(watched: i32, total: i32) -> f64 {
+        if total <= 0 {
+            return 0.0;
+        }
+        let pct = (watched as f64 / total as f64) * 100.0;
+        ((pct * 100.0).round() / 100.0).min(100.0)
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct WatchProgress {
         pub user_id: String,

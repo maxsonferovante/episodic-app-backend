@@ -443,11 +443,8 @@ fn build_series_response(
         })
     }).collect();
 
-    let percentage = if total_episodes > 0 {
-        (((watched_episodes as f64 / total_episodes as f64) * 100.0).round() as i64).min(100)
-    } else {
-        0
-    };
+    let percentage =
+        shared::models::progress::completion_percentage(watched_episodes, total_episodes);
 
     let mut resp = json!({
         "id": series.id,

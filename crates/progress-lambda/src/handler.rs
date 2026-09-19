@@ -72,16 +72,8 @@ fn progress_response(
         .count() as i32;
     let season_total = partition.season_episode_count(season_number);
 
-    let series_pct = if total_episodes > 0 {
-        (watched_count as f64 / total_episodes as f64) * 100.0
-    } else {
-        0.0
-    };
-    let season_pct = if season_total > 0 {
-        (season_watched as f64 / season_total as f64) * 100.0
-    } else {
-        0.0
-    };
+    let series_pct = shared::models::progress::completion_percentage(watched_count, total_episodes);
+    let season_pct = shared::models::progress::completion_percentage(season_watched, season_total);
 
     ProgressResponse {
         episode: EpisodeProgress {
@@ -90,8 +82,8 @@ fn progress_response(
             watched_at,
         },
         progress: SeriesProgress {
-            series_percentage: (series_pct * 10.0).round() / 10.0,
-            season_percentage: (season_pct * 10.0).round() / 10.0,
+            series_percentage: series_pct,
+            season_percentage: season_pct,
             watched_episodes: watched_count,
             total_episodes,
             season_watched_episodes: season_watched,
@@ -325,11 +317,8 @@ async fn handle_season_progress(
         .filter(|((season, _), entry)| *season == season_number && entry.is_watched())
         .count() as i32;
     let season_total = partition.season_episode_count(season_number);
-    let percentage = if total_episodes > 0 {
-        (((watched_count as f64 / total_episodes as f64) * 100.0).round() as i64).min(100)
-    } else {
-        0
-    };
+    let percentage =
+        shared::models::progress::completion_percentage(watched_count, total_episodes);
 
     let body = json!({
         "seriesId": series_id,

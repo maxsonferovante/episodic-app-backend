@@ -87,11 +87,8 @@ async fn handle_list_library(req: Request) -> Result<Response<Body>, AppError> {
 
             let watched = watched_counts.get(&item.series_id).copied().unwrap_or(0);
             let total = meta.map(|m| m.total_episodes).unwrap_or(0);
-            let percentage = if total > 0 {
-                (((watched as f64 / total as f64) * 100.0).round() as i64).min(100)
-            } else {
-                0
-            };
+            let percentage =
+                shared::models::progress::completion_percentage(watched, total);
 
             json!({
                 "id": item.id,
