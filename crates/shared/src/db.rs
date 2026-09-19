@@ -1411,7 +1411,21 @@ pub async fn upsert_episodes(
         }
         if let Some(ref v) = ep.overview { item.insert("overview".to_string(), AttributeValue::S(v.clone())); }
         if let Some(ref v) = ep.still_path { item.insert("stillPath".to_string(), AttributeValue::S(v.clone())); }
-        if let Some(ref v) = ep.air_date { item.insert("airDate".to_string(), AttributeValue::S(v.clone())); }
+        if let Some(ref air_date) = ep.air_date {
+            item.insert("airDate".to_string(), AttributeValue::S(air_date.clone()));
+            // GSI2 air-date index: `AIR#<YYYY-MM>` bucket + `<date>#<series>#S#E`
+            // range key, so a release window is one bounded Query per month.
+            if let Some(month) = air_date.get(..7) {
+                item.insert("GSI2PK".to_string(), AttributeValue::S(format!("AIR#{}", month)));
+                item.insert(
+                    "GSI2SK".to_string(),
+                    AttributeValue::S(format!(
+                        "{}#{}#S{:02}#E{:02}",
+                        air_date, series_id, season_number, ep.episode_number
+                    )),
+                );
+            }
+        }
         if let Some(v) = ep.runtime { item.insert("runtime".to_string(), AttributeValue::N(v.to_string())); }
         if let Some(v) = ep.vote_average { item.insert("voteAverage".to_string(), AttributeValue::N(v.to_string())); }
 
@@ -1609,6 +1623,42 @@ fn date_to_millis(date: &str) -> Option<i64> {
     Some(naive.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis())
 }
 
+/// `YYYY-MM` buckets covering `[from, to)`, one per calendar month.
+fn months_in_window(from: &str, to: &str) -> Vec<String> {
+    use chrono::Datelike;
+
+    let start = match chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d") {
+        Ok(date) => date,
+        Err(_) => return Vec::new(),
+    };
+    let end = match chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d") {
+        Ok(date) => date,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut months = Vec::new();
+    let (mut year, mut month) = (start.year(), start.month());
+
+    loop {
+        let first = match chrono::NaiveDate::from_ymd_opt(year, month, 1) {
+            Some(date) => date,
+            None => break,
+        };
+        if first >= end {
+            break;
+        }
+        months.push(format!("{:04}-{:02}", year, month));
+        if month == 12 {
+            year += 1;
+            month = 1;
+        } else {
+            month += 1;
+        }
+    }
+
+    months
+}
+
 /// English weekday name ("Monday".."Sunday") for a `YYYY-MM-DD` date.
 /// Falls back to "" when the date doesn't parse.
 pub fn weekday_name(date: &str) -> String {
@@ -1721,8 +1771,9 @@ pub const MAX_RELEASE_ITEMS: usize = 300;
 
 /// Every episode from the user's library series airing in `[from, to)`.
 /// Powers the releases views (week / month / 3 months / specific month).
-/// Only episodes already in cache are visible — series never hydrated or
-/// browsed contribute nothing. Episodes without an air date are skipped.
+/// Reads the `GSI2` air-date index, so the cost is one library Query plus one
+/// bounded index Query per month in the window — not one episode Query per
+/// library series. Episodes without an air date are skipped.
 pub async fn get_releases(
     client: &Client,
     table: &str,
@@ -1730,6 +1781,7 @@ pub async fn get_releases(
     from: &str,
     to: &str,
 ) -> Result<Vec<UpcomingItem>, aws_sdk_dynamodb::Error> {
+    // 1. The user's library: series ids plus their display snapshot.
     let lib_result = client
         .query()
         .table_name(table)
@@ -1739,50 +1791,80 @@ pub async fn get_releases(
         .send()
         .await?;
 
+    let mut library: HashMap<String, (String, Option<String>)> = HashMap::new();
+    for item in lib_result.items() {
+        let series_id = get_str(item, "seriesId").to_string();
+        if series_id.is_empty() {
+            continue;
+        }
+        library.insert(
+            series_id,
+            (
+                get_str(item, "name").to_string(),
+                get_opt_str(item, "posterPath").map(str::to_string),
+            ),
+        );
+    }
+
+    if library.is_empty() {
+        return Ok(Vec::new());
+    }
+
     // (air_date, series_id, series_name, poster, season, episode, id, name).
     let mut items: Vec<ReleaseRow> = Vec::new();
 
-    for lib_item in lib_result.items() {
-        let series_id = get_str(lib_item, "seriesId").to_string();
-        let mut series_name = get_str(lib_item, "name").to_string();
-        let mut poster_path = get_opt_str(lib_item, "posterPath").map(|s| s.to_string());
-        if series_name.is_empty() || poster_path.is_none() {
-            let (name, poster) = get_series_ref(client, table, &series_id).await?;
-            if series_name.is_empty() {
-                series_name = name;
-            }
-            if poster_path.is_none() {
-                poster_path = poster;
-            }
-        }
+    // 2. One bounded GSI2 Query per month the window touches. The inclusive
+    //    `BETWEEN` upper bound still implements `[from, to)` because every
+    //    GSI2SK carries a `#<series>#S#E` suffix, making it strictly greater
+    //    than a bare date string; the in-memory date filter below is a second
+    //    correctness layer either way.
+    for month in months_in_window(from, to) {
+        let mut start_key: Option<HashMap<String, AttributeValue>> = None;
 
-        let ep_result = client
-            .query()
-            .table_name(table)
-            .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-            .expression_attribute_values(":pk", AttributeValue::S(format!("SER#{}", series_id)))
-            .expression_attribute_values(":sk_prefix", AttributeValue::S("EP#".to_string()))
-            .send()
-            .await?;
+        loop {
+            let mut request = client
+                .query()
+                .table_name(table)
+                .index_name("GSI2")
+                .key_condition_expression("GSI2PK = :pk AND GSI2SK BETWEEN :start AND :end")
+                .expression_attribute_values(":pk", AttributeValue::S(format!("AIR#{}", month)))
+                .expression_attribute_values(":start", AttributeValue::S(from.to_string()))
+                .expression_attribute_values(":end", AttributeValue::S(to.to_string()));
 
-        for ep_item in ep_result.items() {
-            let air_date = match get_opt_str(ep_item, "airDate") {
-                Some(d) => d.to_string(),
-                None => continue,
-            };
-            if air_date.as_str() < from || air_date.as_str() >= to {
-                continue;
+            if let Some(key) = start_key.take() {
+                request = request.set_exclusive_start_key(Some(key));
             }
-            items.push((
-                air_date,
-                series_id.clone(),
-                series_name.clone(),
-                poster_path.clone(),
-                get_i32(ep_item, "seasonNumber"),
-                get_i32(ep_item, "episodeNumber"),
-                get_str(ep_item, "id").to_string(),
-                get_str(ep_item, "name").to_string(),
-            ));
+
+            let result = request.send().await?;
+
+            for ep_item in result.items() {
+                let series_id = get_str(ep_item, "seriesId").to_string();
+                let (series_name, poster_path) = match library.get(&series_id) {
+                    Some(entry) => entry,
+                    None => continue,
+                };
+
+                let air_date = get_str(ep_item, "airDate").to_string();
+                if air_date.as_str() < from || air_date.as_str() >= to {
+                    continue;
+                }
+
+                items.push((
+                    air_date,
+                    series_id,
+                    series_name.clone(),
+                    poster_path.clone(),
+                    get_i32(ep_item, "seasonNumber"),
+                    get_i32(ep_item, "episodeNumber"),
+                    get_str(ep_item, "id").to_string(),
+                    get_str(ep_item, "name").to_string(),
+                ));
+            }
+
+            match result.last_evaluated_key() {
+                Some(key) => start_key = Some(key.clone()),
+                None => break,
+            }
         }
     }
 
