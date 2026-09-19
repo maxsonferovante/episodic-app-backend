@@ -1,6 +1,9 @@
 use lambda_http::{Body, Request, Response};
 use shared::auth::extract_user_id;
-use shared::db::{get_client, get_library_item, add_to_library, remove_from_library, list_library, get_series_meta, count_watched_in_series, get_series_total_episodes, get_aired_counts, get_cached_seasons};
+use shared::db::{
+    add_to_library, get_client, get_library_item, get_series_meta_bulk, get_user_progress_counts,
+    list_library, remove_from_library,
+};
 use shared::error::{AppError, app_error_response as error_response, add_cors};
 use shared::id;
 use shared::models::library::LibraryItem;
@@ -29,34 +32,6 @@ fn extract_tmdb_id(series_id: &str) -> Option<i64> {
     series_id.strip_prefix("ser_")?.parse().ok()
 }
 
-/// Card total: the sum of every cached season's episodes (specials
-/// included), so it never shrinks to whichever seasons happen to have
-/// cached episode rows. Falls back to the aired/META totals when no
-/// seasons are cached.
-async fn series_card_total(
-    client: &shared::db::Client,
-    table: &str,
-    series_id: &str,
-) -> i32 {
-    if let Some(tmdb_id) = extract_tmdb_id(series_id) {
-        if let Ok(seasons) = get_cached_seasons(client, table, tmdb_id).await {
-            let total: i32 = seasons.iter().map(|s| s.episode_count).sum();
-            if total > 0 {
-                return total;
-            }
-        }
-    }
-    let (aired, _) = get_aired_counts(client, table, series_id)
-        .await
-        .unwrap_or((0, Default::default()));
-    if aired > 0 {
-        return aired;
-    }
-    get_series_total_episodes(client, table, series_id)
-        .await
-        .unwrap_or(0)
-}
-
 pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
     let method = req.method();
     let path = req.uri().path();
@@ -82,65 +57,62 @@ async fn handle_list_library(req: Request) -> Result<Response<Body>, AppError> {
     let items = list_library(&client, &table, &user_id).await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let body: Vec<_> = items.iter().map(|item| {
-        let tmdb_id = extract_tmdb_id(&item.series_id).unwrap_or(0);
-        json!({
-            "id": item.id,
-            "seriesId": item.series_id,
-            "tmdbId": tmdb_id,
-            "addedAt": item.added_at,
-            "name": item.name,
-            "posterPath": item.poster_path,
-            "firstAirDate": item.first_air_date,
-        })
-    }).collect();
+    let series_ids: Vec<String> = items.iter().map(|item| item.series_id.clone()).collect();
 
-    let items_with_details = futures::future::join_all(body.into_iter().map(|mut item| {
-        let client = &client;
-        let table = &table;
-        let user_id = user_id.clone();
-        let series_id = item["seriesId"].as_str().unwrap_or("").to_string();
-        async move {
-            // Name/poster/year/status: stored snapshot first, then synced/catalog meta.
-            if item["name"].is_null() || item["status"].is_null() {
-                if let Ok(Some(meta)) = get_series_meta(client, table, &series_id).await {
-                    if item["name"].is_null() {
-                        item["name"] = json!(meta.name);
-                        item["posterPath"] = json!(meta.poster_path);
-                        item["firstAirDate"] = json!(meta.first_air_date);
-                    }
-                    if item["status"].is_null() {
-                        item["status"] = json!(meta.status);
-                    }
-                }
-            }
+    // The whole page costs two reads: one Query for the user's watched counts
+    // and one BatchGetItem for the series metadata. Previously each series
+    // issued its own count + metadata + season reads.
+    let (watched_counts, metas) = tokio::try_join!(
+        get_user_progress_counts(&client, &table, &user_id),
+        get_series_meta_bulk(&client, &table, &series_ids),
+    )
+    .map_err(|e| AppError::Internal(e.to_string()))?;
 
-            // Watch progress for the card stats (aired episodes only).
-            let watched = count_watched_in_series(client, table, &user_id, &series_id)
-                .await
-                .unwrap_or(0);
-            // Card total: sum of every cached season's episodes (specials
-            // included), so it never shrinks to whichever seasons happen to
-            // have cached episode rows. Falls back to the aired/META totals
-            // when no seasons are cached.
-            let total = series_card_total(client, table, &series_id).await;
+    let body: Vec<_> = items
+        .iter()
+        .map(|item| {
+            let meta = metas.get(&item.series_id);
+
+            // Stored snapshot first, then the canonical series meta.
+            let name = item.name.clone().or_else(|| meta.map(|m| m.name.clone()));
+            let poster_path = item
+                .poster_path
+                .clone()
+                .or_else(|| meta.and_then(|m| m.poster_path.clone()));
+            let first_air_date = item
+                .first_air_date
+                .clone()
+                .or_else(|| meta.and_then(|m| m.first_air_date.clone()));
+            let status = meta.and_then(|m| m.status.clone());
+
+            let watched = watched_counts.get(&item.series_id).copied().unwrap_or(0);
+            let total = meta.map(|m| m.total_episodes).unwrap_or(0);
             let percentage = if total > 0 {
                 (((watched as f64 / total as f64) * 100.0).round() as i64).min(100)
             } else {
                 0
             };
-            item["watchedEpisodes"] = json!(watched);
-            item["totalEpisodes"] = json!(total);
-            item["percentage"] = json!(percentage);
 
-            item
-        }
-    })).await;
+            json!({
+                "id": item.id,
+                "seriesId": item.series_id,
+                "tmdbId": extract_tmdb_id(&item.series_id).unwrap_or(0),
+                "addedAt": item.added_at,
+                "name": name,
+                "posterPath": poster_path,
+                "firstAirDate": first_air_date,
+                "status": status,
+                "watchedEpisodes": watched,
+                "totalEpisodes": total,
+                "percentage": percentage,
+            })
+        })
+        .collect();
 
     let mut resp = Response::builder()
         .status(200)
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&items_with_details).unwrap()))
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
         .unwrap();
     add_cors(&mut resp);
     Ok(resp)

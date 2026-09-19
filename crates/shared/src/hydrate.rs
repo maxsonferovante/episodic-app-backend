@@ -265,10 +265,28 @@ async fn fetch_and_persist_season(
         .collect();
 
     let count = episodes.len();
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let aired = episodes
+        .iter()
+        .filter(|e| {
+            e.air_date
+                .as_deref()
+                .map(|date| date <= today.as_str())
+                .unwrap_or(false)
+        })
+        .count() as i32;
+
     db::upsert_episodes(client, table, canonical_id, &season_id, season.season_number, &episodes)
         .await?;
-    db::upsert_season_meta(client, table, canonical_id, season.season_number, count as i32)
-        .await?;
+    db::upsert_season_meta(
+        client,
+        table,
+        canonical_id,
+        season.season_number,
+        count as i32,
+        aired,
+    )
+    .await?;
 
     Ok((1, count))
 }

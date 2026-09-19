@@ -1,9 +1,12 @@
 use lambda_http::{Body, Request, Response};
 use shared::auth::extract_user_id;
-use shared::db;
+use shared::db::{self, ProgressEntry, SeriesPartition, WatchEventSeed};
 use shared::error::{AppError, app_error_response, add_cors};
-use shared::models::progress::{MarkWatchedRequest, ProgressResponse, EpisodeProgress, SeriesProgress};
+use shared::models::progress::{
+    EpisodeProgress, MarkWatchedRequest, ProgressResponse, SeriesProgress, WatchStatus,
+};
 use serde_json::json;
+use std::collections::HashMap;
 
 fn parse_episode_id(path: &str) -> Option<&str> {
     let prefix = "/api/v1/episodes/";
@@ -35,35 +38,83 @@ fn normalize_series_id(series_id: &str) -> String {
     }
 }
 
-/// Episode total used as the percentage denominator: the sum of every
-/// season's episodes (specials included), so it never shrinks to whichever
-/// seasons happen to have cached episode rows. Falls back to the stored
-/// aired/META totals when no seasons are cached.
-async fn series_episode_total(
+fn json_response(body: String) -> Response<Body> {
+    let mut resp = Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    add_cors(&mut resp);
+    resp
+}
+
+/// Build the progress response purely from an already-fetched progress map and
+/// series partition — no additional reads.
+fn progress_response(
+    episode_id: &str,
+    series_id: &str,
+    season_number: i32,
+    episode_number: i32,
+    progress_map: &HashMap<(i32, i32), ProgressEntry>,
+    partition: &SeriesPartition,
+) -> ProgressResponse {
+    let entry = progress_map.get(&(season_number, episode_number));
+    let status = entry
+        .map(|e| WatchStatus::from_db(&e.status))
+        .unwrap_or(WatchStatus::Unwatched);
+    let watched_at = entry.and_then(|e| e.watched_at.clone());
+
+    let watched_count = progress_map.values().filter(|e| e.is_watched()).count() as i32;
+    let total_episodes = partition.total_episodes();
+    let season_watched = progress_map
+        .iter()
+        .filter(|((season, _), entry)| *season == season_number && entry.is_watched())
+        .count() as i32;
+    let season_total = partition.season_episode_count(season_number);
+
+    let series_pct = if total_episodes > 0 {
+        (watched_count as f64 / total_episodes as f64) * 100.0
+    } else {
+        0.0
+    };
+    let season_pct = if season_total > 0 {
+        (season_watched as f64 / season_total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    ProgressResponse {
+        episode: EpisodeProgress {
+            episode_id: episode_id.to_string(),
+            status,
+            watched_at,
+        },
+        progress: SeriesProgress {
+            series_percentage: (series_pct * 10.0).round() / 10.0,
+            season_percentage: (season_pct * 10.0).round() / 10.0,
+            watched_episodes: watched_count,
+            total_episodes,
+            season_watched_episodes: season_watched,
+            season_total_episodes: season_total,
+        },
+        next_episode: db::next_unwatched_episode(series_id, partition, progress_map),
+    }
+}
+
+/// One progress map + series partition per request. Both are needed by every
+/// branch below, and fetching them together keeps the request at three reads
+/// regardless of how many episodes the series has.
+async fn load_progress_context(
     client: &db::Client,
     table: &str,
+    user_id: &str,
     series_id: &str,
-) -> Result<i32, AppError> {
-    if let Some(tmdb_id) = series_id
-        .strip_prefix("ser_")
-        .and_then(|s| s.parse::<i64>().ok())
-    {
-        if let Ok(seasons) = db::get_cached_seasons(client, table, tmdb_id).await {
-            let total: i32 = seasons.iter().map(|s| s.episode_count).sum();
-            if total > 0 {
-                return Ok(total);
-            }
-        }
-    }
-    let (aired, _) = db::get_aired_counts(client, table, series_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    if aired > 0 {
-        return Ok(aired);
-    }
-    db::get_series_total_episodes(client, table, series_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))
+) -> Result<(HashMap<(i32, i32), ProgressEntry>, SeriesPartition), AppError> {
+    tokio::try_join!(
+        db::get_series_progress_map(client, table, user_id, series_id),
+        db::get_series_partition(client, table, series_id),
+    )
+    .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 pub async fn handle_request(req: Request) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
@@ -120,69 +171,21 @@ async fn handle_get_progress(
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or(AppError::EpisodeNotFound)?;
 
-    let progress = db::get_episode_progress(client, table, user_id, &series_id, season_number, episode_number)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let (progress_map, partition) =
+        load_progress_context(client, table, user_id, &series_id).await?;
 
-    let status = progress
-        .as_ref()
-        .map(|p| p.status.clone())
-        .unwrap_or(shared::models::progress::WatchStatus::Unwatched);
-    let watched_at = progress.as_ref().and_then(|p| p.watched_at.clone());
-
-    let watched_count = db::count_watched_in_series(client, table, user_id, &series_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let total_episodes = series_episode_total(client, table, &series_id).await?;
-    let season_watched = db::count_watched_in_season(client, table, user_id, &series_id, season_number)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let season_total = db::get_season_episode_count(client, table, &series_id, season_number)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let series_pct = if total_episodes > 0 {
-        (watched_count as f64 / total_episodes as f64) * 100.0
-    } else {
-        0.0
-    };
-    let season_pct = if season_total > 0 {
-        (season_watched as f64 / season_total as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let next_episode = db::get_next_unwatched_episode(client, table, user_id, &series_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let response = ProgressResponse {
-        episode: EpisodeProgress {
-            episode_id: episode_id.to_string(),
-            status,
-            watched_at,
-        },
-        progress: SeriesProgress {
-            series_percentage: (series_pct * 10.0).round() / 10.0,
-            season_percentage: (season_pct * 10.0).round() / 10.0,
-            watched_episodes: watched_count,
-            total_episodes,
-            season_watched_episodes: season_watched,
-            season_total_episodes: season_total,
-        },
-        next_episode,
-    };
+    let response = progress_response(
+        episode_id,
+        &series_id,
+        season_number,
+        episode_number,
+        &progress_map,
+        &partition,
+    );
 
     let body = serde_json::to_string(&response)
         .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let mut resp = Response::builder()
-        .status(200)
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap();
-    add_cors(&mut resp);
-    Ok(resp)
+    Ok(json_response(body))
 }
 
 async fn handle_put_progress(
@@ -197,78 +200,73 @@ async fn handle_put_progress(
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or(AppError::EpisodeNotFound)?;
 
-    let current = db::get_episode_progress(client, table, user_id, &series_id, season_number, episode_number)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let (mut progress_map, partition) =
+        load_progress_context(client, table, user_id, &series_id).await?;
 
-    let already_watched = current
-        .as_ref()
-        .map(|p| p.status == shared::models::progress::WatchStatus::Watched)
+    let already_watched = progress_map
+        .get(&(season_number, episode_number))
+        .map(ProgressEntry::is_watched)
         .unwrap_or(false);
 
-    if request.watched && already_watched {
-        let response = build_progress_response(
-            client, table, user_id, episode_id, &series_id, season_number, episode_number,
-        ).await?;
-        let body = serde_json::to_string(&response)
+    // A no-op toggle writes nothing: the existing map already answers.
+    if request.watched != already_watched {
+        let seed = WatchEventSeed {
+            series_id: &series_id,
+            season_number,
+            episode_number,
+            episode_name: partition.episode_name(season_number, episode_number),
+            series_name: Some(partition.name.as_str()),
+            poster_path: partition.poster_path.as_deref(),
+        };
+
+        let (status, event_type, watched_at) = if request.watched {
+            db::mark_episode(client, table, user_id, &series_id, season_number, episode_number)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            (
+                WatchStatus::Watched,
+                shared::enums::watch_event_type::MARK_WATCHED,
+                Some(chrono::Utc::now().to_rfc3339()),
+            )
+        } else {
+            db::unmark_episode(client, table, user_id, &series_id, season_number, episode_number)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            (
+                WatchStatus::Unwatched,
+                shared::enums::watch_event_type::UNMARK_WATCHED,
+                None,
+            )
+        };
+
+        db::create_watch_event(client, table, user_id, episode_id, event_type, &seed)
+            .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        let mut resp = Response::builder()
-            .status(200)
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        add_cors(&mut resp);
-        return Ok(resp);
+
+        progress_map.insert(
+            (season_number, episode_number),
+            ProgressEntry {
+                status: status.as_str().to_string(),
+                watched_at,
+            },
+        );
     }
 
-    if !request.watched && !already_watched {
-        let response = build_progress_response(
-            client, table, user_id, episode_id, &series_id, season_number, episode_number,
-        ).await?;
-        let body = serde_json::to_string(&response)
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        let mut resp = Response::builder()
-            .status(200)
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        add_cors(&mut resp);
-        return Ok(resp);
-    }
-
-    if request.watched {
-        db::mark_episode(client, table, user_id, &series_id, season_number, episode_number)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        db::create_watch_event(client, table, user_id, episode_id, shared::enums::watch_event_type::MARK_WATCHED)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-    } else {
-        db::unmark_episode(client, table, user_id, &series_id, season_number, episode_number)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        db::create_watch_event(client, table, user_id, episode_id, shared::enums::watch_event_type::UNMARK_WATCHED)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-    }
-
-    let response = build_progress_response(
-        client, table, user_id, episode_id, &series_id, season_number, episode_number,
-    ).await?;
+    let response = progress_response(
+        episode_id,
+        &series_id,
+        season_number,
+        episode_number,
+        &progress_map,
+        &partition,
+    );
 
     let body = serde_json::to_string(&response)
         .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let mut resp = Response::builder()
-        .status(200)
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap();
-    add_cors(&mut resp);
-    Ok(resp)
+    Ok(json_response(body))
 }
 
-/// Mark/unmark every episode of a season in one request.
+/// Mark/unmark every aired episode of a season in one request.
 async fn handle_season_progress(
     client: &db::Client,
     table: &str,
@@ -278,32 +276,55 @@ async fn handle_season_progress(
     watched: bool,
 ) -> Result<Response<Body>, AppError> {
     let series_id = normalize_series_id(series_id);
-    let episodes = db::list_season_episode_numbers(client, table, &series_id, season_number)
+
+    let (mut progress_map, partition) =
+        load_progress_context(client, table, user_id, &series_id).await?;
+
+    // Only aired episodes are touched, matching the previous behaviour.
+    let aired = partition.aired_episode_numbers(season_number);
+
+    // Write only the episodes whose state actually changes; the response still
+    // reports every aired episode so the client can flip them all locally.
+    let to_change: Vec<i32> = aired
+        .iter()
+        .copied()
+        .filter(|episode_number| {
+            let is_watched = progress_map
+                .get(&(season_number, *episode_number))
+                .map(ProgressEntry::is_watched)
+                .unwrap_or(false);
+            is_watched != watched
+        })
+        .collect();
+
+    db::mark_episodes_bulk(client, table, user_id, &series_id, season_number, &to_change, watched)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    for episode_number in &episodes {
-        let result = if watched {
-            db::mark_episode(client, table, user_id, &series_id, season_number, *episode_number).await
-        } else {
-            db::unmark_episode(client, table, user_id, &series_id, season_number, *episode_number).await
-        };
-        result.map_err(|e| AppError::Internal(e.to_string()))?;
+    let now = chrono::Utc::now().to_rfc3339();
+    for episode_number in &to_change {
+        progress_map.insert(
+            (season_number, *episode_number),
+            ProgressEntry {
+                status: if watched {
+                    WatchStatus::Watched.as_str().to_string()
+                } else {
+                    WatchStatus::Unwatched.as_str().to_string()
+                },
+                watched_at: if watched { Some(now.clone()) } else { None },
+            },
+        );
     }
 
     // Recompute the caller's totals so the client can update every progress
-    // surface without refetching the series and season. Only aired episodes
-    // were (un)marked above; the totals below cover the whole series.
-    let watched_count = db::count_watched_in_series(client, table, user_id, &series_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let total_episodes = series_episode_total(client, table, &series_id).await?;
-    let season_watched = db::count_watched_in_season(client, table, user_id, &series_id, season_number)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let season_total = db::get_season_episode_count(client, table, &series_id, season_number)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    // surface without refetching the series and season.
+    let watched_count = progress_map.values().filter(|e| e.is_watched()).count() as i32;
+    let total_episodes = partition.total_episodes();
+    let season_watched = progress_map
+        .iter()
+        .filter(|((season, _), entry)| *season == season_number && entry.is_watched())
+        .count() as i32;
+    let season_total = partition.season_episode_count(season_number);
     let percentage = if total_episodes > 0 {
         (((watched_count as f64 / total_episodes as f64) * 100.0).round() as i64).min(100)
     } else {
@@ -314,8 +335,8 @@ async fn handle_season_progress(
         "seriesId": series_id,
         "seasonNumber": season_number,
         "watched": watched,
-        "updatedEpisodes": episodes.len(),
-        "updatedEpisodeNumbers": episodes,
+        "updatedEpisodes": aired.len(),
+        "updatedEpisodeNumbers": aired,
         "progress": {
             "watchedEpisodes": watched_count,
             "totalEpisodes": total_episodes,
@@ -328,74 +349,5 @@ async fn handle_season_progress(
         },
     });
 
-    let mut resp = Response::builder()
-        .status(200)
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    add_cors(&mut resp);
-    Ok(resp)
-}
-
-async fn build_progress_response(
-    client: &db::Client,
-    table: &str,
-    user_id: &str,
-    episode_id: &str,
-    series_id: &str,
-    season_number: i32,
-    episode_number: i32,
-) -> Result<ProgressResponse, AppError> {
-    let progress = db::get_episode_progress(client, table, user_id, series_id, season_number, episode_number)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let status = progress
-        .as_ref()
-        .map(|p| p.status.clone())
-        .unwrap_or(shared::models::progress::WatchStatus::Unwatched);
-    let watched_at = progress.as_ref().and_then(|p| p.watched_at.clone());
-
-    let watched_count = db::count_watched_in_series(client, table, user_id, series_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let total_episodes = series_episode_total(client, table, series_id).await?;
-    let season_watched = db::count_watched_in_season(client, table, user_id, series_id, season_number)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let season_total = db::get_season_episode_count(client, table, series_id, season_number)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let series_pct = if total_episodes > 0 {
-        (watched_count as f64 / total_episodes as f64) * 100.0
-    } else {
-        0.0
-    };
-    let season_pct = if season_total > 0 {
-        (season_watched as f64 / season_total as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let next_episode = db::get_next_unwatched_episode(client, table, user_id, series_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    Ok(ProgressResponse {
-        episode: EpisodeProgress {
-            episode_id: episode_id.to_string(),
-            status,
-            watched_at,
-        },
-        progress: SeriesProgress {
-            series_percentage: (series_pct * 10.0).round() / 10.0,
-            season_percentage: (season_pct * 10.0).round() / 10.0,
-            watched_episodes: watched_count,
-            total_episodes,
-            season_watched_episodes: season_watched,
-            season_total_episodes: season_total,
-        },
-        next_episode,
-    })
+    Ok(json_response(body.to_string()))
 }

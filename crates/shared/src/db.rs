@@ -1,5 +1,5 @@
 pub use aws_sdk_dynamodb::Client;
-use aws_sdk_dynamodb::types::{AttributeValue, PutRequest, WriteRequest};
+use aws_sdk_dynamodb::types::{AttributeValue, KeysAndAttributes, PutRequest, WriteRequest};
 use crate::models::user::User;
 use crate::models::library::LibraryItem;
 use crate::models::progress::{WatchProgress, WatchEvent, WatchStatus, NextEpisode};
@@ -8,7 +8,6 @@ use std::collections::HashMap;
 
 const CACHE_TTL_MONTH: i64 = 30 * 24 * 3600;
 const CACHE_TTL_PROVIDERS: i64 = 7 * 24 * 3600;
-const CACHE_TTL_SEARCH: i64 = 3600;
 
 /// Lazy catalog reads (series / seasons) are cached for a month while airing.
 pub const CACHE_TTL_LAZY_ONGOING: i64 = CACHE_TTL_MONTH;
@@ -202,39 +201,6 @@ async fn get_episode_item(
     Ok(result.item().cloned())
 }
 
-/// Episode numbers for a season that have already aired (airDate <= today), so
-/// bulk "mark season watched" never touches unaired episodes.
-pub async fn list_season_episode_numbers(
-    client: &Client,
-    table: &str,
-    series_id: &str,
-    season_number: i32,
-) -> Result<Vec<i32>, aws_sdk_dynamodb::Error> {
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-
-    let result = client
-        .query()
-        .table_name(table)
-        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(format!("SER#{}", series_id)))
-        .expression_attribute_values(":sk_prefix", AttributeValue::S(format!("EP#{:02}#", season_number)))
-        .send()
-        .await?;
-
-    let mut episodes: Vec<i32> = result
-        .items()
-        .iter()
-        .filter(|item| match get_opt_str(item, "airDate") {
-            Some(air_date) => air_date <= today.as_str(),
-            None => false,
-        })
-        .map(|item| get_i32(item, "episodeNumber"))
-        .filter(|n| *n > 0)
-        .collect();
-    episodes.sort_unstable();
-    Ok(episodes)
-}
-
 /// Series name + poster, preferring the synced series meta and falling back to
 /// the catalog cache keyed by TMDB id.
 /// Series display metadata.
@@ -243,6 +209,8 @@ pub struct SeriesMeta {
     pub poster_path: Option<String>,
     pub first_air_date: Option<String>,
     pub status: Option<String>,
+    /// TMDB's total episode count, used as the denominator on library cards.
+    pub total_episodes: i32,
 }
 
 /// Series display metadata, read from the canonical `SER#<series_id>` row.
@@ -271,11 +239,71 @@ pub async fn get_series_meta(
                 poster_path: get_opt_str(item, "posterPath").map(str::to_string),
                 first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
                 status: get_opt_str(item, "status").map(str::to_string),
+                total_episodes: get_i32(item, "numberOfEpisodes"),
             }));
         }
     }
 
     Ok(None)
+}
+
+/// Series display metadata for many series in one `BatchGetItem` (100 keys per
+/// batch), so `/library` no longer issues one read per series.
+pub async fn get_series_meta_bulk(
+    client: &Client,
+    table: &str,
+    series_ids: &[String],
+) -> Result<HashMap<String, SeriesMeta>, aws_sdk_dynamodb::Error> {
+    let mut metas = HashMap::new();
+    if series_ids.is_empty() {
+        return Ok(metas);
+    }
+
+    for chunk in series_ids.chunks(100) {
+        let mut keys = Vec::with_capacity(chunk.len());
+        for series_id in chunk {
+            let mut key = HashMap::new();
+            key.insert("PK".to_string(), AttributeValue::S(format!("SER#{}", series_id)));
+            key.insert("SK".to_string(), AttributeValue::S("META".to_string()));
+            keys.push(key);
+        }
+
+        let mut request_items = HashMap::new();
+        request_items.insert(
+            table.to_string(),
+            KeysAndAttributes::builder().set_keys(Some(keys)).build()?,
+        );
+
+        let result = client
+            .batch_get_item()
+            .set_request_items(Some(request_items))
+            .send()
+            .await?;
+
+        let responses = result.responses();
+        for item in responses.and_then(|r| r.get(table)).into_iter().flatten() {
+            let name = get_str(item, "name").to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let series_id = get_str(item, "PK")
+                .strip_prefix("SER#")
+                .unwrap_or_default()
+                .to_string();
+            metas.insert(
+                series_id,
+                SeriesMeta {
+                    name,
+                    poster_path: get_opt_str(item, "posterPath").map(str::to_string),
+                    first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
+                    status: get_opt_str(item, "status").map(str::to_string),
+                    total_episodes: get_i32(item, "numberOfEpisodes"),
+                },
+            );
+        }
+    }
+
+    Ok(metas)
 }
 
 /// Name + poster convenience wrapper.
@@ -290,39 +318,295 @@ async fn get_series_ref(
     })
 }
 
-pub async fn get_episode_progress(
+/// A user's progress row for one `(season, episode)`, as stored on
+/// `PROG#<series>#<ss>#<ee>`.
+#[derive(Debug, Clone)]
+pub struct ProgressEntry {
+    pub status: String,
+    pub watched_at: Option<String>,
+}
+
+impl ProgressEntry {
+    pub fn is_watched(&self) -> bool {
+        self.status == WatchStatus::Watched.as_str()
+    }
+}
+
+/// Every progress row the user has for one series, keyed by
+/// `(season_number, episode_number)`.
+///
+/// One Query replaces the fan-out that used to be issued while scanning for
+/// the next unwatched episode (one `GetItem` per episode) and the two
+/// overlapping `count_watched_*` Queries.
+pub async fn get_series_progress_map(
     client: &Client,
     table: &str,
     user_id: &str,
     series_id: &str,
-    season_number: i32,
-    episode_number: i32,
-) -> Result<Option<WatchProgress>, aws_sdk_dynamodb::Error> {
-    let sk = format!("PROG#{}#{:02}#{:02}", series_id, season_number, episode_number);
+) -> Result<HashMap<(i32, i32), ProgressEntry>, aws_sdk_dynamodb::Error> {
+    let prefix = format!("PROG#{}#", series_id);
 
     let result = client
-        .get_item()
+        .query()
         .table_name(table)
-        .key("PK", AttributeValue::S(format!("USR#{}", user_id)))
-        .key("SK", AttributeValue::S(sk))
+        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
+        .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)))
+        .expression_attribute_values(":sk_prefix", AttributeValue::S(prefix))
         .send()
         .await?;
 
-    let item = match result.item() {
-        Some(item) => item,
-        None => return Ok(None),
+    let mut map = HashMap::with_capacity(result.items().len());
+    for item in result.items() {
+        map.insert(
+            (get_i32(item, "seasonNumber"), get_i32(item, "episodeNumber")),
+            ProgressEntry {
+                status: get_str(item, "status").to_string(),
+                watched_at: get_opt_str(item, "watchedAt").map(str::to_string),
+            },
+        );
+    }
+
+    Ok(map)
+}
+
+/// Watched-episode count per series for one user, from a single paginated
+/// Query over every `PROG#` row they own.
+///
+/// Replaces the per-series `count_watched_in_series` fan-out used by
+/// `/library`.
+pub async fn get_user_progress_counts(
+    client: &Client,
+    table: &str,
+    user_id: &str,
+) -> Result<HashMap<String, i32>, aws_sdk_dynamodb::Error> {
+    let mut counts: HashMap<String, i32> = HashMap::new();
+    let mut last_key: Option<HashMap<String, AttributeValue>> = None;
+
+    loop {
+        let mut request = client
+            .query()
+            .table_name(table)
+            .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
+            .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)))
+            .expression_attribute_values(":sk_prefix", AttributeValue::S("PROG#".to_string()));
+
+        if let Some(key) = last_key.take() {
+            request = request.set_exclusive_start_key(Some(key));
+        }
+
+        let result = request.send().await?;
+
+        for item in result.items() {
+            if get_str(item, "status") != WatchStatus::Watched.as_str() {
+                continue;
+            }
+            let series_id = get_str(item, "seriesId");
+            if series_id.is_empty() {
+                continue;
+            }
+            *counts.entry(series_id.to_string()).or_insert(0) += 1;
+        }
+
+        match result.last_evaluated_key() {
+            Some(key) => last_key = Some(key.clone()),
+            None => break,
+        }
+    }
+
+    Ok(counts)
+}
+
+/// One episode coordinate from a series partition.
+#[derive(Debug, Clone)]
+pub struct EpisodeRow {
+    pub season_number: i32,
+    pub episode_number: i32,
+    pub name: String,
+    pub air_date: Option<String>,
+}
+
+/// The whole `SER#<series_id>` partition — `META`, every `SN#` and every
+/// `EP#` — read in a single paginated Query.
+///
+/// Collapsing these into one round trip removes the per-request fan-out into
+/// separate season, aired-count, total-count and episode reads.
+pub struct SeriesPartition {
+    pub name: String,
+    pub poster_path: Option<String>,
+    pub number_of_episodes: i32,
+    pub seasons: Vec<crate::models::season::Season>,
+    pub episodes: Vec<EpisodeRow>,
+}
+
+impl SeriesPartition {
+    /// Sum of every season's episode count (specials included), falling back
+    /// to the aired episode count and then to the stored series total — the
+    /// same precedence `series_episode_total` used.
+    pub fn total_episodes(&self) -> i32 {
+        let season_sum: i32 = self.seasons.iter().map(|s| s.episode_count).sum();
+        if season_sum > 0 {
+            return season_sum;
+        }
+        let aired = self.aired_episode_count(None);
+        if aired > 0 {
+            return aired;
+        }
+        self.number_of_episodes
+    }
+
+    /// Number of episodes that have already aired, optionally scoped to one
+    /// season.
+    pub fn aired_episode_count(&self, season_number: Option<i32>) -> i32 {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        self.episodes
+            .iter()
+            .filter(|e| season_number.is_none_or(|s| e.season_number == s))
+            .filter(|e| e.episode_number > 0)
+            .filter(|e| match e.air_date.as_deref() {
+                Some(date) => date <= today.as_str(),
+                None => false,
+            })
+            .count() as i32
+    }
+
+    /// Episode numbers that have already aired for a season, ascending.
+    pub fn aired_episode_numbers(&self, season_number: i32) -> Vec<i32> {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let mut numbers: Vec<i32> = self
+            .episodes
+            .iter()
+            .filter(|e| e.season_number == season_number && e.episode_number > 0)
+            .filter(|e| match e.air_date.as_deref() {
+                Some(date) => date <= today.as_str(),
+                None => false,
+            })
+            .map(|e| e.episode_number)
+            .collect();
+        numbers.sort_unstable();
+        numbers
+    }
+
+    pub fn season_episode_count(&self, season_number: i32) -> i32 {
+        self.seasons
+            .iter()
+            .find(|s| s.season_number == season_number)
+            .map(|s| s.episode_count)
+            .unwrap_or(0)
+    }
+
+    pub fn episode_name(&self, season_number: i32, episode_number: i32) -> Option<&str> {
+        self.episodes
+            .iter()
+            .find(|e| e.season_number == season_number && e.episode_number == episode_number)
+            .map(|e| e.name.as_str())
+    }
+}
+
+pub async fn get_series_partition(
+    client: &Client,
+    table: &str,
+    series_id: &str,
+) -> Result<SeriesPartition, aws_sdk_dynamodb::Error> {
+    let mut partition = SeriesPartition {
+        name: String::new(),
+        poster_path: None,
+        number_of_episodes: 0,
+        seasons: Vec::new(),
+        episodes: Vec::new(),
     };
 
-    let status = WatchStatus::from_db(get_str(item, "status"));
+    let mut last_key: Option<HashMap<String, AttributeValue>> = None;
+    loop {
+        let mut request = client
+            .query()
+            .table_name(table)
+            .key_condition_expression("PK = :pk")
+            .expression_attribute_values(":pk", AttributeValue::S(format!("SER#{}", series_id)));
 
-    Ok(Some(WatchProgress {
-        user_id: user_id.to_string(),
-        series_id: series_id.to_string(),
-        season_number,
-        episode_number,
-        status,
-        watched_at: item.get("watchedAt").and_then(|v| v.as_s().ok()).map(|s| s.to_string()),
-    }))
+        if let Some(key) = last_key.take() {
+            request = request.set_exclusive_start_key(Some(key));
+        }
+
+        let result = request.send().await?;
+
+        for item in result.items() {
+            let sk = get_str(item, "SK");
+            if sk == "META" {
+                partition.name = get_str(item, "name").to_string();
+                partition.poster_path = get_opt_str(item, "posterPath").map(str::to_string);
+                partition.number_of_episodes = get_i32(item, "numberOfEpisodes");
+            } else if sk.starts_with("SN#") {
+                partition.seasons.push(crate::models::season::Season {
+                    id: get_str(item, "id").to_string(),
+                    series_id: get_str(item, "seriesId").to_string(),
+                    tmdb_id: item
+                        .get("tmdbId")
+                        .and_then(|v| v.as_n().ok())
+                        .and_then(|n| n.parse::<i64>().ok()),
+                    season_number: get_i32(item, "seasonNumber"),
+                    name: get_str(item, "name").to_string(),
+                    overview: get_opt_str(item, "overview").map(str::to_string),
+                    poster_path: get_opt_str(item, "posterPath").map(str::to_string),
+                    air_date: get_opt_str(item, "airDate").map(str::to_string),
+                    episode_count: get_i32(item, "episodeCount"),
+                });
+            } else if sk.starts_with("EP#") {
+                partition.episodes.push(EpisodeRow {
+                    season_number: get_i32(item, "seasonNumber"),
+                    episode_number: get_i32(item, "episodeNumber"),
+                    name: get_str(item, "name").to_string(),
+                    air_date: get_opt_str(item, "airDate").map(str::to_string),
+                });
+            }
+        }
+
+        match result.last_evaluated_key() {
+            Some(key) => last_key = Some(key.clone()),
+            None => break,
+        }
+    }
+
+    Ok(partition)
+}
+
+/// First episode (specials first, then season/episode order) that the user has
+/// not marked watched. Pure — derived from an already-fetched partition and
+/// progress map, so it costs no extra reads.
+pub fn next_unwatched_episode(
+    series_id: &str,
+    partition: &SeriesPartition,
+    progress: &HashMap<(i32, i32), ProgressEntry>,
+) -> Option<NextEpisode> {
+    let mut episodes: Vec<&EpisodeRow> = partition
+        .episodes
+        .iter()
+        .filter(|e| e.episode_number > 0)
+        .collect();
+    episodes.sort_by(|a, b| {
+        a.season_number
+            .cmp(&b.season_number)
+            .then(a.episode_number.cmp(&b.episode_number))
+    });
+
+    for episode in episodes {
+        let is_watched = progress
+            .get(&(episode.season_number, episode.episode_number))
+            .map(ProgressEntry::is_watched)
+            .unwrap_or(false);
+        if !is_watched {
+            return Some(NextEpisode {
+                episode_id: format!(
+                    "{}#S{:02}#E{:02}",
+                    series_id, episode.season_number, episode.episode_number
+                ),
+                series_id: series_id.to_string(),
+                season_number: episode.season_number,
+                episode_number: episode.episode_number,
+            });
+        }
+    }
+
+    None
 }
 
 pub async fn mark_episode(
@@ -397,12 +681,24 @@ pub async fn unmark_episode(
     })
 }
 
+/// Metadata the caller has already resolved, so writing a watch event needs
+/// no extra reads. Built by the progress handler from the series partition.
+pub struct WatchEventSeed<'a> {
+    pub series_id: &'a str,
+    pub season_number: i32,
+    pub episode_number: i32,
+    pub episode_name: Option<&'a str>,
+    pub series_name: Option<&'a str>,
+    pub poster_path: Option<&'a str>,
+}
+
 pub async fn create_watch_event(
     client: &Client,
     table: &str,
     user_id: &str,
     episode_id: &str,
     event_type: &str,
+    seed: &WatchEventSeed<'_>,
 ) -> Result<WatchEvent, aws_sdk_dynamodb::Error> {
     let now = chrono::Utc::now();
     let timestamp = now.timestamp_millis();
@@ -416,29 +712,23 @@ pub async fn create_watch_event(
     item.insert("occurredAt".to_string(), AttributeValue::S(now.to_rfc3339()));
 
     // Enrich the event so history reads don't need extra lookups.
-    if let Ok(Some((series_id, season_number, episode_number))) =
-        get_episode_by_id(client, table, episode_id).await
-    {
-        let mut episode_name = String::new();
-        if let Ok(Some(ep)) = get_episode_item(client, table, &series_id, season_number, episode_number).await {
-            episode_name = get_str(&ep, "name").to_string();
-        }
-        let (series_name, poster_path) = get_series_ref(client, table, &series_id)
-            .await
-            .unwrap_or((String::new(), None));
-
-        item.insert("seriesId".to_string(), AttributeValue::S(series_id));
-        item.insert("seasonNumber".to_string(), AttributeValue::N(season_number.to_string()));
-        item.insert("episodeNumber".to_string(), AttributeValue::N(episode_number.to_string()));
-        if !episode_name.is_empty() {
-            item.insert("episodeName".to_string(), AttributeValue::S(episode_name));
-        }
-        if !series_name.is_empty() {
-            item.insert("seriesName".to_string(), AttributeValue::S(series_name));
-        }
-        if let Some(p) = poster_path {
-            item.insert("posterPath".to_string(), AttributeValue::S(p));
-        }
+    item.insert("seriesId".to_string(), AttributeValue::S(seed.series_id.to_string()));
+    item.insert(
+        "seasonNumber".to_string(),
+        AttributeValue::N(seed.season_number.to_string()),
+    );
+    item.insert(
+        "episodeNumber".to_string(),
+        AttributeValue::N(seed.episode_number.to_string()),
+    );
+    if let Some(name) = seed.episode_name.filter(|n| !n.is_empty()) {
+        item.insert("episodeName".to_string(), AttributeValue::S(name.to_string()));
+    }
+    if let Some(name) = seed.series_name.filter(|n| !n.is_empty()) {
+        item.insert("seriesName".to_string(), AttributeValue::S(name.to_string()));
+    }
+    if let Some(poster) = seed.poster_path {
+        item.insert("posterPath".to_string(), AttributeValue::S(poster.to_string()));
     }
 
     client
@@ -456,78 +746,101 @@ pub async fn create_watch_event(
     })
 }
 
-pub async fn count_watched_in_series(
-    client: &Client,
-    table: &str,
-    user_id: &str,
-    series_id: &str,
-) -> Result<i32, aws_sdk_dynamodb::Error> {
-    let prefix = format!("PROG#{}#", series_id);
-
-    let result = client
-        .query()
-        .table_name(table)
-        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)))
-        .expression_attribute_values(":sk_prefix", AttributeValue::S(prefix))
-        .send()
-        .await?;
-
-    let count = result.items()
-        .iter()
-        .filter(|item| get_str(item, "status") == WatchStatus::Watched.as_str())
-        .count() as i32;
-
-    Ok(count)
-}
-
-pub async fn count_watched_in_season(
+/// Mark (or unmark) many episodes of one season in a single `BatchWriteItem`
+/// per 25 items, instead of one `PutItem` per episode.
+pub async fn mark_episodes_bulk(
     client: &Client,
     table: &str,
     user_id: &str,
     series_id: &str,
     season_number: i32,
-) -> Result<i32, aws_sdk_dynamodb::Error> {
-    let prefix = format!("PROG#{}#{:02}#", series_id, season_number);
+    episode_numbers: &[i32],
+    watched: bool,
+) -> Result<(), aws_sdk_dynamodb::Error> {
+    if episode_numbers.is_empty() {
+        return Ok(());
+    }
 
-    let result = client
-        .query()
-        .table_name(table)
-        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)))
-        .expression_attribute_values(":sk_prefix", AttributeValue::S(prefix))
-        .send()
-        .await?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut requests = Vec::with_capacity(episode_numbers.len());
 
-    let count = result.items()
-        .iter()
-        .filter(|item| get_str(item, "status") == WatchStatus::Watched.as_str())
-        .count() as i32;
+    for &episode_number in episode_numbers {
+        let mut item = HashMap::new();
+        item.insert("PK".to_string(), AttributeValue::S(format!("USR#{}", user_id)));
+        item.insert(
+            "SK".to_string(),
+            AttributeValue::S(format!(
+                "PROG#{}#{:02}#{:02}",
+                series_id, season_number, episode_number
+            )),
+        );
+        item.insert("seriesId".to_string(), AttributeValue::S(series_id.to_string()));
+        item.insert(
+            "seasonNumber".to_string(),
+            AttributeValue::N(season_number.to_string()),
+        );
+        item.insert(
+            "episodeNumber".to_string(),
+            AttributeValue::N(episode_number.to_string()),
+        );
+        item.insert(
+            "status".to_string(),
+            AttributeValue::S(if watched {
+                WatchStatus::Watched.as_str().to_string()
+            } else {
+                WatchStatus::Unwatched.as_str().to_string()
+            }),
+        );
+        if watched {
+            item.insert("watchedAt".to_string(), AttributeValue::S(now.clone()));
+        }
 
-    Ok(count)
-}
+        requests.push(
+            WriteRequest::builder()
+                .put_request(PutRequest::builder().set_item(Some(item)).build()?)
+                .build(),
+        );
+    }
 
-pub async fn get_season_episode_count(
-    client: &Client,
-    table: &str,
-    series_id: &str,
-    season_number: i32,
-) -> Result<i32, aws_sdk_dynamodb::Error> {
-    let sk = format!("SN#{:02}", season_number);
+    for chunk in requests.chunks(25) {
+        let mut pending: Vec<WriteRequest> = chunk.to_vec();
 
-    let result = client
-        .get_item()
-        .table_name(table)
-        .key("PK", AttributeValue::S(format!("SER#{}", series_id)))
-        .key("SK", AttributeValue::S(sk))
-        .send()
-        .await?;
+        // BatchWriteItem can return unprocessed items under throttling; retry
+        // them a bounded number of times so a mark is never silently dropped.
+        for attempt in 0..5 {
+            let mut request_items = HashMap::new();
+            request_items.insert(table.to_string(), pending.clone());
+            let result = client
+                .batch_write_item()
+                .set_request_items(Some(request_items))
+                .send()
+                .await?;
 
-    let count = result.item()
-        .map(|item| get_i32(item, "episodeCount"))
-        .unwrap_or(0);
+            pending = result
+                .unprocessed_items()
+                .and_then(|items| items.get(table))
+                .cloned()
+                .unwrap_or_default();
 
-    Ok(count)
+            if pending.is_empty() {
+                break;
+            }
+            if attempt < 4 {
+                tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt + 1))).await;
+            }
+        }
+
+        if !pending.is_empty() {
+            tracing::warn!(
+                "{} progress writes still unprocessed after retries for {} S{:02}",
+                pending.len(),
+                series_id,
+                season_number
+            );
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn get_series_total_episodes(
@@ -550,15 +863,47 @@ pub async fn get_series_total_episodes(
     Ok(count)
 }
 
-/// Aired episodes (airDate <= today) for a series: total and per season.
+/// Aired episodes per season for a series.
+///
+/// Prefers the `airedCount` rollup that hydrate/season-detail write onto each
+/// `SN#` row — one small Query, no episode scan. Falls back to the legacy
+/// per-episode scan when the rollup is absent (series cached before the rollup
+/// existed), so the response never changes just because of the migration.
 pub async fn get_aired_counts(
     client: &Client,
     table: &str,
     series_id: &str,
 ) -> Result<(i32, HashMap<i32, i32>), aws_sdk_dynamodb::Error> {
+    let result = client
+        .query()
+        .table_name(table)
+        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
+        .expression_attribute_values(":pk", AttributeValue::S(format!("SER#{}", series_id)))
+        .expression_attribute_values(":sk_prefix", AttributeValue::S("SN#".to_string()))
+        .send()
+        .await?;
+
+    let items = result.items();
+
+    if items.iter().any(|item| item.contains_key("airedCount")) {
+        let mut by_season: HashMap<i32, i32> = HashMap::new();
+        for item in items {
+            let season = get_i32(item, "seasonNumber");
+            let aired = item
+                .get("airedCount")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<i32>().ok())
+                .unwrap_or_else(|| get_i32(item, "episodeCount"));
+            by_season.insert(season, aired);
+        }
+        let total = by_season.values().sum();
+        return Ok((total, by_season));
+    }
+
+    // Legacy path: count aired episode rows.
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
-    let result = client
+    let episodes = client
         .query()
         .table_name(table)
         .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
@@ -569,7 +914,7 @@ pub async fn get_aired_counts(
 
     let mut by_season: HashMap<i32, i32> = HashMap::new();
     let mut total = 0;
-    for item in result.items() {
+    for item in episodes.items() {
         if let Some(air_date) = get_opt_str(item, "airDate") {
             if air_date <= today.as_str() {
                 let season = get_i32(item, "seasonNumber");
@@ -580,69 +925,6 @@ pub async fn get_aired_counts(
     }
 
     Ok((total, by_season))
-}
-
-pub async fn get_next_unwatched_episode(
-    client: &Client,
-    table: &str,
-    user_id: &str,
-    series_id: &str,
-) -> Result<Option<NextEpisode>, aws_sdk_dynamodb::Error> {
-    let result = client
-        .query()
-        .table_name(table)
-        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(format!("SER#{}", series_id)))
-        .expression_attribute_values(":sk_prefix", AttributeValue::S("EP#".to_string()))
-        .send()
-        .await?;
-
-    let mut episodes: Vec<(i32, i32, String)> = result.items()
-        .iter()
-        .filter_map(|item| {
-            let season = get_i32(item, "seasonNumber");
-            let episode = get_i32(item, "episodeNumber");
-            // Specials (season 0) are eligible: they count towards progress and
-            // sort first, so they can be the next unwatched episode.
-            if episode > 0 {
-                let pk = get_str(item, "PK");
-                let sid = pk.strip_prefix("SER#").unwrap_or(pk).to_string();
-                Some((season, episode, sid))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    episodes.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-    for (season, episode, sid) in &episodes {
-        let progress = get_episode_progress(
-            client,
-            table,
-            user_id,
-            sid,
-            *season,
-            *episode,
-        ).await?;
-
-        let is_watched = progress
-            .as_ref()
-            .map(|p| p.status == WatchStatus::Watched)
-            .unwrap_or(false);
-
-        if !is_watched {
-            let episode_id = format!("{}#S{:02}#E{:02}", sid, season, episode);
-            return Ok(Some(NextEpisode {
-                episode_id,
-                series_id: sid.clone(),
-                season_number: *season,
-                episode_number: *episode,
-            }));
-        }
-    }
-
-    Ok(None)
 }
 
 pub async fn get_cached_series(client: &Client, table: &str, tmdb_id: i64) -> Result<Option<crate::models::series::Series>, aws_sdk_dynamodb::Error> {
@@ -960,85 +1242,6 @@ pub async fn get_cached_providers(
     }))
 }
 
-pub async fn cache_search_results(
-    client: &Client,
-    table: &str,
-    query: &str,
-    page: i32,
-    results: &[crate::models::series::CatalogSeries],
-    total_pages: i32,
-) -> Result<(), aws_sdk_dynamodb::Error> {
-    let expires_at = chrono::Utc::now().timestamp() + CACHE_TTL_SEARCH;
-    let cache_key = format!("SEARCH#{}#{}", query.to_lowercase(), page);
-    
-    let serialized = serde_json::to_string(&serde_json::json!({
-        "results": results,
-        "total_pages": total_pages,
-    })).unwrap_or_default();
-
-    let mut item = HashMap::new();
-    item.insert("PK".to_string(), AttributeValue::S(cache_key));
-    item.insert("SK".to_string(), AttributeValue::S("RESULTS".to_string()));
-    item.insert("expiresAt".to_string(), AttributeValue::N(expires_at.to_string()));
-    item.insert("data".to_string(), AttributeValue::S(serialized));
-
-    client
-        .put_item()
-        .table_name(table)
-        .set_item(Some(item))
-        .send()
-        .await?;
-
-    Ok(())
-}
-
-pub async fn get_cached_search(
-    client: &Client,
-    table: &str,
-    query: &str,
-    page: i32,
-) -> Result<Option<(Vec<crate::models::series::CatalogSeries>, i32)>, aws_sdk_dynamodb::Error> {
-    let cache_key = format!("SEARCH#{}#{}", query.to_lowercase(), page);
-    
-    let result = client
-        .get_item()
-        .table_name(table)
-        .key("PK", AttributeValue::S(cache_key))
-        .key("SK", AttributeValue::S("RESULTS".to_string()))
-        .send()
-        .await?;
-
-    let item = match result.item() {
-        Some(item) => item,
-        None => return Ok(None),
-    };
-
-    if is_cache_expired(item) {
-        return Ok(None);
-    }
-
-    let data = match item.get("data").and_then(|v| v.as_s().ok()) {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-
-    let parsed: serde_json::Value = match serde_json::from_str(data) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
-
-    let results: Vec<crate::models::series::CatalogSeries> = match serde_json::from_value(
-        parsed.get("results").cloned().unwrap_or(serde_json::Value::Array(vec![]))
-    ) {
-        Ok(r) => r,
-        Err(_) => return Ok(None),
-    };
-
-    let total_pages = parsed.get("total_pages").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
-
-    Ok(Some((results, total_pages)))
-}
-
 pub async fn get_cached_seasons(client: &Client, table: &str, tmdb_id: i64) -> Result<Vec<crate::models::season::Season>, aws_sdk_dynamodb::Error> {
     let result = client
         .query()
@@ -1211,15 +1414,17 @@ pub async fn upsert_season_meta(
     series_id: &str,
     season_number: i32,
     episode_count: i32,
+    aired_count: i32,
 ) -> Result<(), aws_sdk_dynamodb::Error> {
     client
         .update_item()
         .table_name(table)
         .key("PK", AttributeValue::S(format!("SER#{}", series_id)))
         .key("SK", AttributeValue::S(format!("SN#{:02}", season_number)))
-        .update_expression("SET seasonNumber = :sn, episodeCount = :ec")
+        .update_expression("SET seasonNumber = :sn, episodeCount = :ec, airedCount = :ac")
         .expression_attribute_values(":sn", AttributeValue::N(season_number.to_string()))
         .expression_attribute_values(":ec", AttributeValue::N(episode_count.to_string()))
+        .expression_attribute_values(":ac", AttributeValue::N(aired_count.to_string()))
         .send()
         .await?;
 

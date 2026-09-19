@@ -44,27 +44,19 @@ async fn handle_search(req: Request) -> Result<Response<Body>, Box<dyn std::erro
     let table = std::env::var("DYNAMODB_TABLE_NAME").unwrap_or_else(|_| "episodic".to_string());
     let client = db::get_client().await;
 
-    let (items, total_pages) = if let Ok(Some((cached_items, cached_total_pages))) =
-        db::get_cached_search(&client, &table, &q, page).await
-    {
-        (cached_items, cached_total_pages)
-    } else {
-        let search_resp = match shared::tmdb::search_tv(&q, page).await {
-            Ok(r) => r,
-            Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB search failed: {}", e)))),
-        };
-
-        let items: Vec<CatalogSeries> = search_resp.results.into_iter().map(|r| CatalogSeries {
-            id: r.id,
-            name: r.name,
-            poster_path: r.poster_path,
-            first_air_date: r.first_air_date,
-        }).collect();
-
-        let _ = db::cache_search_results(&client, &table, &q, page, &items, search_resp.total_pages).await;
-
-        (items, search_resp.total_pages)
+    // Search always goes to TMDB — results are never served from the cache.
+    let search_resp = match shared::tmdb::search_tv(&q, page).await {
+        Ok(r) => r,
+        Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB search failed: {}", e)))),
     };
+
+    let items: Vec<CatalogSeries> = search_resp.results.into_iter().map(|r| CatalogSeries {
+        id: r.id,
+        name: r.name,
+        poster_path: r.poster_path,
+        first_air_date: r.first_air_date,
+    }).collect();
+    let total_pages = search_resp.total_pages;
 
     // Flag which results are already in the caller's library, so the client
     // doesn't have to fetch the whole library to render the state.
@@ -351,35 +343,52 @@ async fn handle_season_detail(
     let season_id = db::season_id(tmdb_id, season_number);
 
     // Resolve episodes from cache, falling back to TMDB.
-    let mut episodes = match db::get_cached_episodes(&client, &table, tmdb_id, season_number).await {
-        Ok(cached) if !cached.is_empty() => cached,
-        _ => {
-            let detail = match shared::tmdb::get_tv_season_detail(tmdb_id, season_number).await {
-                Ok(d) => d,
-                Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB season detail failed: {}", e)))),
-            };
+    let (mut episodes, from_tmdb) =
+        match db::get_cached_episodes(&client, &table, tmdb_id, season_number).await {
+            Ok(cached) if !cached.is_empty() => (cached, false),
+            _ => {
+                let detail = match shared::tmdb::get_tv_season_detail(tmdb_id, season_number).await {
+                    Ok(d) => d,
+                    Err(e) => return Ok(error_response(AppError::Internal(format!("TMDB season detail failed: {}", e)))),
+                };
 
-            detail.episodes.into_iter().map(|e| Episode {
-                id: format!("epi_{}", e.id),
-                series_id: series_id.clone(),
-                season_id: season_id.clone(),
-                tmdb_id: Some(e.id),
-                episode_number: e.episode_number,
-                name: e.name,
-                overview: e.overview,
-                still_path: e.still_path,
-                air_date: e.air_date,
-                runtime: e.runtime,
-                vote_average: e.vote_average,
-                status: None,
-            }).collect()
-        }
-    };
+                (
+                    detail.episodes.into_iter().map(|e| Episode {
+                        id: format!("epi_{}", e.id),
+                        series_id: series_id.clone(),
+                        season_id: season_id.clone(),
+                        tmdb_id: Some(e.id),
+                        episode_number: e.episode_number,
+                        name: e.name,
+                        overview: e.overview,
+                        still_path: e.still_path,
+                        air_date: e.air_date,
+                        runtime: e.runtime,
+                        vote_average: e.vote_average,
+                        status: None,
+                    }).collect(),
+                    true,
+                )
+            }
+        };
 
-    // Persist (upsert) so episode ids stay resolvable on GSI1 for the progress
-    // lambda, and so season episode counts exist for percentage maths.
-    let _ = db::upsert_episodes(&client, &table, &series_id, &season_id, season_number, &episodes).await;
-    let _ = db::upsert_season_meta(&client, &table, &series_id, season_number, episodes.len() as i32).await;
+    // Persist only when the data came from TMDB: on a cache hit the rows (and
+    // the season rollup) already exist, so a read stays a read.
+    if from_tmdb {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let aired = episodes
+            .iter()
+            .filter(|e| {
+                e.air_date
+                    .as_deref()
+                    .map(|date| date <= today.as_str())
+                    .unwrap_or(false)
+            })
+            .count() as i32;
+
+        let _ = db::upsert_episodes(&client, &table, &series_id, &season_id, season_number, &episodes).await;
+        let _ = db::upsert_season_meta(&client, &table, &series_id, season_number, episodes.len() as i32, aired).await;
+    }
 
     // Merge the caller's watch status when authenticated.
     if let Some(user_id) = user_id {
