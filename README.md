@@ -15,7 +15,7 @@ Cargo workspace (`crates/`):
 | `catalog-lambda` | TMDB search and series/seasons/episodes, cached in DynamoDB |
 | `library-lambda` | User library CRUD and per-series progress |
 | `progress-lambda` | Mark/unmark episodes (single or whole season) and watch events |
-| `dashboard-lambda` | Dashboard (`upcoming`, recent history), history, calendar, releases |
+| `dashboard-lambda` | History, calendar and release windows |
 | `sync-job` | Daily **scheduler**: scans library series and enqueues a hydrate message for the ones needing a refresh (never fetches TMDB itself) |
 | `hydrate-worker` | SQS consumer: fully hydrates one series from TMDB (details, seasons, episodes, providers) and persists it canonically |
 
@@ -126,7 +126,6 @@ caller's user id.
 | GET | `/api/v1/episodes/{id}/progress` | Episode progress |
 | PUT | `/api/v1/episodes/{id}/progress` | Mark/unmark an episode — `{ "watched": true }` |
 | PUT | `/api/v1/episodes/season/{seriesId}/{n}/progress` | Mark/unmark a whole season (aired episodes only) |
-| GET | `/api/v1/dashboard` | `upcoming` + recent history (kept for API compatibility; the web app uses `/releases` and `/history`) |
 | GET | `/api/v1/releases?from=&to=` | Library episodes airing in the window (also `month=YYYY-MM`) |
 | GET | `/api/v1/history?cursor=&limit=` | Paginated watch history |
 | GET | `/api/v1/calendar?from=&to=` | Calendar of episodes (also accepts `month=YYYY-MM`) |
