@@ -66,6 +66,10 @@ fn is_cache_expired(item: &HashMap<String, AttributeValue>) -> bool {
     chrono::Utc::now().timestamp() > expires_at
 }
 
+fn get_bool(item: &HashMap<String, AttributeValue>, key: &str) -> bool {
+    item.get(key).and_then(|v| v.as_bool().ok()).copied().unwrap_or(false)
+}
+
 fn get_i32(item: &HashMap<String, AttributeValue>, key: &str) -> i32 {
     item.get(key)
         .and_then(|v| v.as_n().ok())
@@ -1522,15 +1526,21 @@ pub async fn get_library_item(
         None => return Ok(None),
     };
 
-    Ok(Some(LibraryItem {
+    Ok(Some(library_item_from(item, user_id)))
+}
+
+fn library_item_from(item: &HashMap<String, AttributeValue>, user_id: &str) -> LibraryItem {
+    LibraryItem {
         id: get_str(item, "id").to_string(),
         user_id: user_id.to_string(),
         series_id: get_str(item, "seriesId").to_string(),
         added_at: get_str(item, "addedAt").to_string(),
+        favorite: get_bool(item, "favorite"),
+        status: get_opt_str(item, "status").map(str::to_string),
         name: get_opt_str(item, "name").map(str::to_string),
         poster_path: get_opt_str(item, "posterPath").map(str::to_string),
         first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
-    }))
+    }
 }
 
 pub async fn add_to_library(
@@ -1544,7 +1554,22 @@ pub async fn add_to_library(
     db_item.insert("id".to_string(), AttributeValue::S(item.id.clone()));
     db_item.insert("seriesId".to_string(), AttributeValue::S(item.series_id.clone()));
     db_item.insert("addedAt".to_string(), AttributeValue::S(item.added_at.clone()));
+    db_item.insert("favorite".to_string(), AttributeValue::Bool(item.favorite));
+    if let Some(ref status) = item.status {
+        db_item.insert("status".to_string(), AttributeValue::S(status.clone()));
+    }
+    // GSI1 reverse lookup by series (used to fan out status changes) and GSI3
+    // for newest-first library pagination.
     db_item.insert("GSI1PK".to_string(), AttributeValue::S(format!("SERIES#{}", item.series_id)));
+    db_item.insert(
+        "GSI1SK".to_string(),
+        AttributeValue::S(format!("LIB#{}#{}", item.user_id, item.series_id)),
+    );
+    db_item.insert("GSI3PK".to_string(), AttributeValue::S(format!("USR#{}", item.user_id)));
+    db_item.insert(
+        "GSI3SK".to_string(),
+        AttributeValue::S(format!("{}#{}", item.added_at, item.series_id)),
+    );
 
     // Snapshot of the series metadata at add time.
     if let Some(ref name) = item.name {
@@ -1584,33 +1609,303 @@ pub async fn remove_from_library(
     Ok(())
 }
 
+/// One page of a user's library plus the raw (unsealed) resume key.
+pub struct LibraryPage {
+    pub items: Vec<LibraryItem>,
+    /// Raw `GSI3SK` (`<addedAt>#<series_id>`) of the last returned item, or
+    /// `None` at the end.
+    pub next_cursor: Option<String>,
+}
+
+/// Keyset-paginated library read, newest-first.
+///
+/// Reads GSI3 (`GSI3PK = USR#<uid>`, `GSI3SK = <addedAt>#<series_id>`) with
+/// `ScanIndexForward = false`. `status`/`favorite` filters are applied by
+/// DynamoDB as a `FilterExpression` on the denormalized attributes, and the
+/// loop keeps reading until `limit` matching rows are collected (a filter can
+/// leave a page short), so callers always get a full page or the end.
+pub async fn list_library_page(
+    client: &Client,
+    table: &str,
+    user_id: &str,
+    status: Option<&str>,
+    favorite_only: bool,
+    cursor: Option<&str>,
+    limit: i32,
+) -> Result<LibraryPage, aws_sdk_dynamodb::Error> {
+    let limit = limit.clamp(1, 100);
+    let mut items: Vec<LibraryItem> = Vec::new();
+    let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+    let mut next_cursor: Option<String> = None;
+
+    loop {
+        let mut request = client
+            .query()
+            .table_name(table)
+            .index_name("GSI3")
+            .scan_index_forward(false)
+            .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)));
+
+        // First request resumes from the client cursor with `GSI3SK < cursor`
+        // (descending); later iterations use ExclusiveStartKey.
+        if let Some(sk) = cursor.filter(|_| start_key.is_none()) {
+            request = request
+                .key_condition_expression("GSI3PK = :pk AND GSI3SK < :cursor")
+                .expression_attribute_values(":cursor", AttributeValue::S(sk.to_string()));
+        } else {
+            request = request.key_condition_expression("GSI3PK = :pk");
+        }
+
+        if let Some(key) = start_key.take() {
+            request = request.set_exclusive_start_key(Some(key));
+        }
+
+        // Build the status/favorite filter.
+        let mut filter_parts: Vec<&str> = Vec::new();
+        if let Some(status) = status {
+            request = request.expression_attribute_names("#status", "status");
+            if status == "unknown" {
+                filter_parts.push("attribute_not_exists(#status)");
+            } else {
+                filter_parts.push("#status = :status");
+                request = request
+                    .expression_attribute_values(":status", AttributeValue::S(status.to_string()));
+            }
+        }
+        if favorite_only {
+            filter_parts.push("favorite = :favorite");
+            request = request.expression_attribute_values(":favorite", AttributeValue::Bool(true));
+        }
+        if !filter_parts.is_empty() {
+            request = request.filter_expression(filter_parts.join(" AND "));
+        }
+
+        let result = request.send().await?;
+
+        for item in result.items() {
+            if items.len() as i32 >= limit {
+                break;
+            }
+            items.push(library_item_from(item, user_id));
+        }
+
+        if items.len() as i32 >= limit {
+            // Full page: resume strictly after the last returned row's GSI3SK.
+            next_cursor = items
+                .last()
+                .map(|i| format!("{}#{}", i.added_at, i.series_id));
+            break;
+        }
+
+        match result.last_evaluated_key() {
+            Some(key) => start_key = Some(key.clone()),
+            None => break,
+        }
+    }
+
+    Ok(LibraryPage { items, next_cursor })
+}
+
+/// Every library item for a user, with no pagination. Used by catalog search
+/// to flag which results are already in the caller's library.
 pub async fn list_library(
     client: &Client,
     table: &str,
     user_id: &str,
 ) -> Result<Vec<LibraryItem>, aws_sdk_dynamodb::Error> {
-    let result = client
-        .query()
+    let mut items = Vec::new();
+    let mut cursor: Option<String> = None;
+
+    loop {
+        let page =
+            list_library_page(client, table, user_id, None, false, cursor.as_deref(), 100).await?;
+        items.extend(page.items);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    Ok(items)
+}
+
+/// Per-status and favorites totals for the library sidebar. One projected
+/// pass over the `LIB#` partition — no metadata join, no progress scan.
+pub async fn library_status_counts(
+    client: &Client,
+    table: &str,
+    user_id: &str,
+) -> Result<HashMap<String, i32>, aws_sdk_dynamodb::Error> {
+    let mut counts: HashMap<String, i32> = HashMap::new();
+    let mut total = 0i32;
+    let mut favorites = 0i32;
+    let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+
+    loop {
+        let mut request = client
+            .query()
+            .table_name(table)
+            .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
+            .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)))
+            .expression_attribute_values(":sk_prefix", AttributeValue::S("LIB#".to_string()))
+            .expression_attribute_names("#status", "status")
+            .projection_expression("#status, favorite");
+
+        if let Some(key) = start_key.take() {
+            request = request.set_exclusive_start_key(Some(key));
+        }
+
+        let result = request.send().await?;
+
+        for item in result.items() {
+            total += 1;
+            if get_bool(item, "favorite") {
+                favorites += 1;
+            }
+            let key = get_opt_str(item, "status").unwrap_or("unknown").to_string();
+            *counts.entry(key).or_insert(0) += 1;
+        }
+
+        match result.last_evaluated_key() {
+            Some(key) => start_key = Some(key.clone()),
+            None => break,
+        }
+    }
+
+    counts.insert("all".to_string(), total);
+    counts.insert("favorites".to_string(), favorites);
+    Ok(counts)
+}
+
+/// Fan a series' new status out to every user's `LIB#` row for that series.
+///
+/// Uses GSI1 (`GSI1PK = SERIES#<series_id>`) to find the rows without scanning.
+/// Called after a hydrate refresh so the denormalized status (and therefore
+/// the library filter/counts) stays live. Best-effort: a failure here never
+/// fails the hydrate.
+pub async fn propagate_series_status(
+    client: &Client,
+    table: &str,
+    series_id: &str,
+    status: &str,
+) -> Result<usize, aws_sdk_dynamodb::Error> {
+    let mut updated = 0usize;
+    let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+
+    loop {
+        let mut request = client
+            .query()
+            .table_name(table)
+            .index_name("GSI1")
+            .key_condition_expression("GSI1PK = :pk")
+            .expression_attribute_values(
+                ":pk",
+                AttributeValue::S(format!("SERIES#{}", series_id)),
+            );
+
+        if let Some(key) = start_key.take() {
+            request = request.set_exclusive_start_key(Some(key));
+        }
+
+        let result = request.send().await?;
+
+        // Collect (PK, SK) first so the borrow ends before the writes.
+        let keys: Vec<(String, String)> = result
+            .items()
+            .iter()
+            .filter_map(|item| {
+                let sk = get_str(item, "SK").to_string();
+                if !sk.starts_with("LIB#") {
+                    return None;
+                }
+                let pk = item.get("PK").and_then(|v| v.as_s().ok())?.clone();
+                Some((pk, sk))
+            })
+            .collect();
+
+        for (pk, sk) in keys {
+            client
+                .update_item()
+                .table_name(table)
+                .key("PK", AttributeValue::S(pk))
+                .key("SK", AttributeValue::S(sk))
+                .update_expression("SET #status = :status")
+                .expression_attribute_names("#status", "status")
+                .expression_attribute_values(":status", AttributeValue::S(status.to_string()))
+                .send()
+                .await?;
+            updated += 1;
+        }
+
+        match result.last_evaluated_key() {
+            Some(key) => start_key = Some(key.clone()),
+            None => break,
+        }
+    }
+
+    Ok(updated)
+}
+
+/// Write the current TMDB status onto a `LIB#` row. Best-effort heal used by
+/// the list handler so filter/counts converge without a metadata fan-out.
+pub async fn set_library_status(
+    client: &Client,
+    table: &str,
+    user_id: &str,
+    series_id: &str,
+    status: &str,
+) -> Result<(), aws_sdk_dynamodb::Error> {
+    client
+        .update_item()
         .table_name(table)
-        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(format!("USR#{}", user_id)))
-        .expression_attribute_values(":sk_prefix", AttributeValue::S("LIB#".to_string()))
+        .key("PK", AttributeValue::S(format!("USR#{}", user_id)))
+        .key("SK", AttributeValue::S(format!("LIB#{}", series_id)))
+        .update_expression("SET #status = :status")
+        .expression_attribute_names("#status", "status")
+        .expression_attribute_values(":status", AttributeValue::S(status.to_string()))
         .send()
         .await?;
 
-    let items = result.items().iter().map(|item| {
-        LibraryItem {
-            id: get_str(item, "id").to_string(),
-            user_id: user_id.to_string(),
-            series_id: get_str(item, "seriesId").to_string(),
-            added_at: get_str(item, "addedAt").to_string(),
-            name: get_opt_str(item, "name").map(str::to_string),
-            poster_path: get_opt_str(item, "posterPath").map(str::to_string),
-            first_air_date: get_opt_str(item, "firstAirDate").map(str::to_string),
-        }
-    }).collect();
+    Ok(())
+}
 
-    Ok(items)
+/// Toggle the `favorite` flag on a `LIB#` row. Returns `false` when the series
+/// is not in the user's library (caller maps that to `NotInLibrary`).
+pub async fn set_library_favorite(
+    client: &Client,
+    table: &str,
+    user_id: &str,
+    series_id: &str,
+    favorite: bool,
+) -> Result<bool, aws_sdk_dynamodb::Error> {
+    use aws_sdk_dynamodb::types::ReturnValue;
+
+    let result = client
+        .update_item()
+        .table_name(table)
+        .key("PK", AttributeValue::S(format!("USR#{}", user_id)))
+        .key("SK", AttributeValue::S(format!("LIB#{}", series_id)))
+        .condition_expression("attribute_exists(PK)")
+        .update_expression("SET favorite = :favorite")
+        .expression_attribute_values(":favorite", AttributeValue::Bool(favorite))
+        .return_values(ReturnValue::AllNew)
+        .send()
+        .await;
+
+    match result {
+        Ok(_) => Ok(true),
+        Err(err) => {
+            if err
+                .as_service_error()
+                .map(|e| e.is_conditional_check_failed_exception())
+                .unwrap_or(false)
+            {
+                Ok(false)
+            } else {
+                Err(err.into())
+            }
+        }
+    }
 }
 
 fn get_opt_str<'a>(item: &'a HashMap<String, AttributeValue>, key: &str) -> Option<&'a str> {

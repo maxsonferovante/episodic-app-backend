@@ -122,6 +122,14 @@ async fn hydrate_inner(
     };
     db::cache_series(client, table, &series, expires_at).await?;
 
+    // Keep the library's denormalized status in sync for every user that has
+    // this series. Best-effort: a fan-out failure must not fail the hydrate.
+    if !status.is_empty() {
+        if let Err(e) = db::propagate_series_status(client, table, &canonical_id, &status).await {
+            tracing::warn!("Failed to propagate status for {}: {}", canonical_id, e);
+        }
+    }
+
     let today = now.format("%Y-%m-%d").to_string();
 
     // Season rows for every season, including specials (season 0). Specials are

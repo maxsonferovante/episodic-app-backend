@@ -28,6 +28,36 @@ pub enum Error {
     InvalidCursor,
 }
 
+/// Percent-decode a query value (`%23` -> `#`, `+` -> space). API Gateway
+/// forwards query values still-encoded and `req.uri().query()` does not decode
+/// them, so a `%3D`-padded cursor must be decoded before opening.
+pub fn url_decode(s: &str) -> String {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn read_key() -> Result<[u8; 32], Error> {
     let raw = std::env::var("CURSOR_FERNET_KEY").map_err(|_| Error::MissingKey)?;
     cursor_crypto::decode_key(&raw).map_err(|_| Error::InvalidKey)

@@ -133,6 +133,14 @@ pub mod library {
         pub user_id: String,
         pub series_id: String,
         pub added_at: String,
+        /// Whether the user starred this series. Drives the "Destaques"
+        /// section and the Favorites filter in the library.
+        #[serde(default)]
+        pub favorite: bool,
+        /// Denormalized TMDB status, kept in sync from the `SER#` meta so the
+        /// library can filter and count by status without joining metadata.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
         /// Snapshot of the series metadata at the moment it was added, so the
         /// library renders immediately without waiting for the sync job.
         #[serde(skip_serializing_if = "Option::is_none")]
