@@ -3,3 +3,7 @@
 *.d
 *.o
 Cargo.lock
+.repowise
+.claude
+.vscode
+.mcp.json
